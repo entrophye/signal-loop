@@ -16,7 +16,6 @@ steps:
 with:
 python-version: '3.11'
 
-
 - name: Install system dependencies
 run: sudo apt-get update && sudo apt-get install -y ffmpeg
 
@@ -27,17 +26,14 @@ python -m pip install --upgrade pip
 pip install -r requirements.txt
 
 
-- name: Render & upload longform
+- name: Render & upload longform (autonomous)
 env:
 YOUTUBE_CLIENT_ID: ${{ secrets.YOUTUBE_CLIENT_ID }}
 YOUTUBE_CLIENT_SECRET: ${{ secrets.YOUTUBE_CLIENT_SECRET }}
 YOUTUBE_REFRESH_TOKEN: ${{ secrets.YOUTUBE_REFRESH_TOKEN }}
-ELEVEN_API_KEY: ${{ secrets.ELEVEN_API_KEY }}
-CHANNEL_KEYWORDS: ${{ secrets.CHANNEL_KEYWORDS }}
-TTS_PROVIDER: gtts
 LANG: en
-VIDEO_DURATION: "90" # seconds; set 120 for 2 minutes
-SCENES_MIN: "6"
-SCENES_MAX: "9"
+VIDEO_DURATION: "120"
+SCENES_MIN: "7"
+SCENES_MAX: "10"
 run: |
-python main_longform.py
+python main_longform_auto.py
