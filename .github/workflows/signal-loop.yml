@@ -1,39 +1,36 @@
 name: Signal Loop Longform
 
-
 on:
-schedule:
-- cron: "0 18 * * *" # every day 21:00 Türkiye (UTC+3). GitHub cron is UTC; 18:00 UTC = 21:00 TRT
-workflow_dispatch: {}
-
+  schedule:
+    - cron: "0 18 * * *"   # her gün 21:00 TRT (GitHub cron UTC; 18:00 UTC = 21:00 TRT)
+  workflow_dispatch: {}
 
 jobs:
-build-run:
-runs-on: ubuntu-latest
-steps:
-- uses: actions/checkout@v4
-- uses: actions/setup-python@v5
-with:
-python-version: '3.11'
+  build-run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
 
-- name: Install system dependencies
-run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
 
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
 
-- name: Install deps
-run: |
-python -m pip install --upgrade pip
-pip install -r requirements.txt
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
-
-- name: Render & upload longform (autonomous)
-env:
-YOUTUBE_CLIENT_ID: ${{ secrets.YOUTUBE_CLIENT_ID }}
-YOUTUBE_CLIENT_SECRET: ${{ secrets.YOUTUBE_CLIENT_SECRET }}
-YOUTUBE_REFRESH_TOKEN: ${{ secrets.YOUTUBE_REFRESH_TOKEN }}
-LANG: en
-VIDEO_DURATION: "120"
-SCENES_MIN: "7"
-SCENES_MAX: "10"
-run: |
-python main_longform_auto.py
+      - name: Render & upload longform (autonomous)
+        env:
+          YOUTUBE_CLIENT_ID: ${{ secrets.YOUTUBE_CLIENT_ID }}
+          YOUTUBE_CLIENT_SECRET: ${{ secrets.YOUTUBE_CLIENT_SECRET }}
+          YOUTUBE_REFRESH_TOKEN: ${{ secrets.YOUTUBE_REFRESH_TOKEN }}
+          LANG: en
+          VIDEO_DURATION: "120"
+          SCENES_MIN: "7"
+          SCENES_MAX: "10"
+        run: |
+          python main_longform_auto.py
