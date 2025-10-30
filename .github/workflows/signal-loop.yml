@@ -1,35 +1,43 @@
-name: Signal Loop
+name: Signal Loop Longform
+
 
 on:
-  schedule:
-    - cron: "0 */6 * * *"
-  workflow_dispatch: {}
+schedule:
+- cron: "0 18 * * *" # every day 21:00 Türkiye (UTC+3). GitHub cron is UTC; 18:00 UTC = 21:00 TRT
+workflow_dispatch: {}
+
 
 jobs:
-  build-run:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
+build-run:
+runs-on: ubuntu-latest
+steps:
+- uses: actions/checkout@v4
+- uses: actions/setup-python@v5
+with:
+python-version: '3.11'
 
-      - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y ffmpeg
 
-      - name: Install deps
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
+- name: Install system dependencies
+run: sudo apt-get update && sudo apt-get install -y ffmpeg
 
-      - name: Run pipeline
-        env:
-          YOUTUBE_CLIENT_ID: ${{ secrets.YOUTUBE_CLIENT_ID }}
-          YOUTUBE_CLIENT_SECRET: ${{ secrets.YOUTUBE_CLIENT_SECRET }}
-          YOUTUBE_REFRESH_TOKEN: ${{ secrets.YOUTUBE_REFRESH_TOKEN }}
-          ELEVEN_API_KEY: ${{ secrets.ELEVEN_API_KEY }}
-          CHANNEL_KEYWORDS: ${{ secrets.CHANNEL_KEYWORDS }}
-          TTS_PROVIDER: gtts
-          LANG: en
-        run: |
-          python main.py
+
+- name: Install deps
+run: |
+python -m pip install --upgrade pip
+pip install -r requirements.txt
+
+
+- name: Render & upload longform
+env:
+YOUTUBE_CLIENT_ID: ${{ secrets.YOUTUBE_CLIENT_ID }}
+YOUTUBE_CLIENT_SECRET: ${{ secrets.YOUTUBE_CLIENT_SECRET }}
+YOUTUBE_REFRESH_TOKEN: ${{ secrets.YOUTUBE_REFRESH_TOKEN }}
+ELEVEN_API_KEY: ${{ secrets.ELEVEN_API_KEY }}
+CHANNEL_KEYWORDS: ${{ secrets.CHANNEL_KEYWORDS }}
+TTS_PROVIDER: gtts
+LANG: en
+VIDEO_DURATION: "90" # seconds; set 120 for 2 minutes
+SCENES_MIN: "6"
+SCENES_MAX: "9"
+run: |
+python main_longform.py
