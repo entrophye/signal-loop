@@ -89,7 +89,7 @@ def render_video(text, voice_mp3, out_mp4, duration=10):
         def make_frame(t):
             base = int(8 + 4 * abs((t % 2) - 1))
             val = 10 + base
-            return np.uint8([[[val, val, val]]]])
+            return np.uint8([[[val, val, val]]])
 
         clip = VideoClip(make_frame, duration=duration).resize((1080, 1920))
     else:
