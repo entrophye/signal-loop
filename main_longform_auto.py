@@ -1,5 +1,5 @@
 # main_longform_auto.py
-import os, random, uuid, textwrap
+import os, random, uuid, textwrap, re
 from pathlib import Path
 from datetime import datetime
 
@@ -12,12 +12,10 @@ from pydub import AudioSegment
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
 
 from moviepy.editor import (
-    ImageClip,
-    AudioFileClip,
-    CompositeVideoClip,
-    VideoClip,
+    ImageClip, AudioFileClip, CompositeVideoClip, VideoClip,
+    concatenate_videoclips
 )
-from moviepy.video.fx.all import crop
+from moviepy.video.fx.all import crop, crossfadein
 
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
@@ -32,23 +30,20 @@ load_dotenv()
 ROOT = Path(__file__).parent
 DATA = ROOT / "data"
 OVERLAYS = DATA / "overlays"
+SCENE_ASSETS = DATA / "scene_assets"
 AUTOSEEDS = DATA / "autoseeds.txt"
 OUT = ROOT / "out"
-for p in (DATA, OVERLAYS, OUT):
+for p in (DATA, OVERLAYS, SCENE_ASSETS, OUT):
     p.mkdir(exist_ok=True)
 
 LANG = os.getenv("LANG", "en")
-
-# Render hedefi (dikey)
 TARGET_W, TARGET_H = 720, 1280
-
-# Süre ve sahne konfigleri
-VIDEO_DURATION = int(os.getenv("VIDEO_DURATION", "120"))  # üst sınır/niyet
+VIDEO_DURATION_CAP = int(os.getenv("VIDEO_DURATION", "120"))
 SCENES_MIN = int(os.getenv("SCENES_MIN", "7"))
 SCENES_MAX = int(os.getenv("SCENES_MAX", "10"))
 
 # =========================
-# SEED / METİN
+# SEEDS / SCRIPT
 # =========================
 BASE_SEEDS = [
     "God is not gone. He's buried.",
@@ -61,25 +56,17 @@ BASE_SEEDS = [
     "Report says light is safe; the light disagrees.",
     "If you hear the Pulse, do not count with it; it counts you.",
 ]
-
 HOOKS = [
     "Transmission begins.",
     "Archive fragment recovered.",
     "Field log: Eclipsera — Sector Hell’s Eve.",
     "After the collapse, we listened.",
 ]
-
 REPLACE_MAP = {
-    "God": "the divine",
-    "light": "signal",
-    "darkness": "static",
-    "soil": "veil",
-    "bones": "wires",
-    "blood": "current",
-    "song": "frequency",
-    "prayer": "protocol",
+    "God": "the divine", "light": "signal", "darkness": "static",
+    "soil": "veil", "bones": "wires", "blood": "current",
+    "song": "frequency", "prayer": "protocol",
 }
-
 
 def load_seeds():
     lines = []
@@ -90,23 +77,19 @@ def load_seeds():
                 lines.append(s)
     if not lines:
         lines = BASE_SEEDS[:]
-    # unique (sıra korunur)
     return list(dict.fromkeys(lines))
-
 
 def mutate_line(s: str) -> str:
     words = s.split()
-    if not words:
-        return s
+    if not words: return s
     for i, w in enumerate(words):
         key = w.strip(".,;:!?\"'")
         if key in REPLACE_MAP and random.random() < 0.25:
             words[i] = w.replace(key, REPLACE_MAP[key])
     if random.random() < 0.15 and len(words) > 4:
-        j = random.randrange(1, len(words) - 1)
+        j = random.randrange(1, len(words)-1)
         words.insert(j, random.choice(["slowly", "again", "beneath"]))
     return " ".join(words)
-
 
 def evolve_and_store(new_lines):
     pool = load_seeds()
@@ -117,80 +100,94 @@ def evolve_and_store(new_lines):
             out.append(m)
     AUTOSEEDS.write_text("\n".join(out[-500:]), encoding="utf-8")
 
-
 def make_script_longform():
-    """
-    Mini 3-akt yapı:
-    Hook → Discovery (2) → Escalation (2) → Revelation (2) → Tag (imza)
-    TTS için tek parça 'full' metin, sahne başlıkları için kısa 'scene_caps'.
-    """
+    """Hook → Discovery(2) → Escalation(2) → Revelation(2) → Tag"""
     bank = load_seeds()
     pick = lambda n: random.sample(bank, min(n, len(bank)))
-
     hook = random.choice(HOOKS)
-    discovery = pick(2)
-    escalation = pick(2)
-    revelation = pick(2)
+    discovery = pick(2); escalation = pick(2); revelation = pick(2)
     tag = random.choice([
         "God is not gone. He’s buried.",
         "The Pulse counts backwards.",
         "No maps survived the light.",
         "Silence replied in numbers.",
     ])
-
-    paragraphs = [hook] + discovery + escalation + revelation + [tag]
-    full = " ".join(paragraphs)
-    full = " ".join(full.split())
-    if len(full) > 900:
-        full = full[:897] + "…"
-
-    caps = []
-    caps.append(hook)
-    for s in (discovery + escalation + revelation):
-        caps.append(s if len(s) <= 90 else (s[:87] + "…"))
-    caps.append(tag)
+    pieces = [hook] + discovery + escalation + revelation + [tag]
+    full = " ".join(" ".join(pieces).split())
+    if len(full) > 900: full = full[:897] + "…"
+    # sahne başlıkları
+    caps = [hook] + [s if len(s) <= 90 else s[:87]+"…" for s in (discovery+escalation+revelation)] + [tag]
     return full, caps
 
+# =========================
+# SIMPLE KEYWORDING
+# =========================
+KW_MAP = {
+    r"\b(pulse|signal|frequency|static)\b": ["oscilloscope", "astronomy radio", "deep space", "waveform"],
+    r"\b(god|divine|prayer|cathedral|ritual)\b": ["cathedral ruin", "ancient temple", "monastery night"],
+    r"\b(soil|desert|sand|veil)\b": ["desert night", "dune", "barren landscape"],
+    r"\b(light|eclipse|star|sun)\b": ["eclipse", "stars", "galaxy", "nebula"],
+    r"\b(bones|wires|machine|protocol)\b": ["factory interior", "industrial ruin", "circuit board macro"],
+    r"\b(whisper|silence|numbers)\b": ["library dark", "crypt", "void"],
+    r"\b(map|ruin|archive)\b": ["ruins", "old manuscript", "ancient map"],
+}
+
+def extract_keywords(line: str):
+    qs = []
+    for pat, choices in KW_MAP.items():
+        if re.search(pat, line, flags=re.I):
+            qs += choices
+    if not qs:
+        qs = ["eclipse", "alien landscape", "ruins night", "galaxy", "nebula"]
+    return list(dict.fromkeys(qs))[:3]  # en fazla 3 arama
 
 # =========================
-# AUDIO TASARIM
+# AUDIO DESIGN (PER-CHUNK)
 # =========================
 def _pitch_down(seg, semitones=-2.5):
     new_fr = int(seg.frame_rate * (2.0 ** (semitones / 12.0)))
     return seg._spawn(seg.raw_data, overrides={"frame_rate": new_fr}).set_frame_rate(seg.frame_rate)
-
 
 def _echo(seg, delay_ms=240, decay_db=-10):
     echo_part = seg - 6
     echo_part = AudioSegment.silent(duration=delay_ms) + (echo_part + decay_db)
     return seg.overlay(echo_part)
 
-
 def _drone(duration_ms, freq=62.0, vol_db=-24):
-    # Basit sinüs drone'u (mono)
     sr = 44100
-    t = np.linspace(0, duration_ms / 1000.0, int(sr * duration_ms / 1000.0), endpoint=False)
-    wave = (np.sin(2 * np.pi * freq * t) * 32767).astype(np.int16).tobytes()
+    t = np.linspace(0, duration_ms/1000.0, int(sr*duration_ms/1000.0), endpoint=False)
+    wave = (np.sin(2*np.pi*freq*t)*32767).astype(np.int16).tobytes()
     return AudioSegment(data=wave, sample_width=2, frame_rate=sr, channels=1) + vol_db
 
-
-def tts_and_design(text, raw_mp3_path):
+def tts_chunks_and_concatenate(lines):
     """
-    raw_mp3_path: gTTS çıktısı (ham)
-    Dönen: tasarlanmış ses dosyası (drone + pitch + echo) yolu
+    Her sahne için ayrı TTS üret → gerçek süreleri al → concat et.
+    Döner: combined_path, durations_sec(list), per_chunk_paths(list)
     """
-    v = AudioSegment.from_file(raw_mp3_path).set_channels(1).set_frame_rate(44100)
-    v = _pitch_down(v, -2.5)
-    v = _echo(v, 240, -10)
+    chunk_paths, durations = [], []
+    for i, txt in enumerate(lines):
+        path = OUT / f"tts_{i:02d}_{uuid.uuid4().hex[:4]}.mp3"
+        gTTS(text=txt, lang="en").save(str(path))
+        seg = AudioSegment.from_file(path).set_channels(1).set_frame_rate(44100)
+        seg = _pitch_down(seg, -2.5)
+        seg = _echo(seg, 200, -9)
+        # kısa parçaları minimum 3 sn’e uzat
+        if len(seg) < 3000:
+            seg = seg + AudioSegment.silent(duration=3000 - len(seg))
+        seg.export(path, format="mp3")
+        chunk_paths.append(str(path))
+        durations.append(len(seg) / 1000.0)
 
-    # Hedef süre: ses, VIDEO_DURATION'ı aşabilir; sorun değil.
-    d = _drone(len(v), freq=random.choice([49.0, 62.0, 73.0]), vol_db=-25)
-    mix = _echo(d.overlay(v), 410, -14)
+    # birleşik + drone tabanı
+    combined = AudioSegment.silent(duration=0)
+    for p in chunk_paths:
+        combined += AudioSegment.from_file(p)
+    drone = _drone(len(combined), freq=random.choice([49.0, 62.0, 73.0]), vol_db=-26)
+    mix = _echo(drone.overlay(combined), 410, -14)
 
-    out2 = str(OUT / f"voice_{uuid.uuid4().hex[:6]}.mp3")
-    mix.export(out2, format="mp3")
-    return out2
-
+    out_path = str(OUT / f"voice_{uuid.uuid4().hex[:6]}.mp3")
+    mix.export(out_path, format="mp3")
+    return out_path, durations, chunk_paths
 
 # =========================
 # CAPTION PNG
@@ -201,145 +198,106 @@ def caption_png(text: str, width=900, padding=26):
         font = ImageFont.truetype("DejaVuSans.ttf", 54)
     except Exception:
         font = ImageFont.load_default()
-
-    dummy = Image.new("RGBA", (width, 10), (0, 0, 0, 0))
+    dummy = Image.new("RGBA", (width, 10), (0,0,0,0))
     d = ImageDraw.Draw(dummy)
     bbox = d.multiline_textbbox((0, 0), wrapped, font=font, align="center", spacing=6)
-    w, h = bbox[2] - bbox[0], bbox[3] - bbox[1]
-
-    img = Image.new("RGBA", (width + 2 * padding, h + 2 * padding), (0, 0, 0, 0))
-    # Shadow stroke
+    w, h = bbox[2]-bbox[0], bbox[3]-bbox[1]
+    img = Image.new("RGBA", (width+2*padding, h+2*padding), (0,0,0,0))
+    # gölge
     sd = ImageDraw.Draw(img)
-    for ox, oy in ((1, 1), (2, 2), (-1, 1), (1, -1), (-2, -2)):
-        sd.multiline_text(
-            (img.width // 2 + ox, padding + oy),
-            wrapped,
-            font=font,
-            fill=(0, 0, 0, 160),
-            align="center",
-            anchor="ma",
-            spacing=6,
-        )
-    # White text
+    for ox, oy in ((1,1),(2,2),(-1,1),(1,-1),(-2,-2)):
+        sd.multiline_text((img.width//2+ox, padding+oy), wrapped, font=font, fill=(0,0,0,160),
+                          align="center", anchor="ma", spacing=6)
+    # beyaz
     d2 = ImageDraw.Draw(img)
-    d2.multiline_text(
-        (img.width // 2, padding),
-        wrapped,
-        font=font,
-        fill=(255, 255, 255, 255),
-        align="center",
-        anchor="ma",
-        spacing=6,
-    )
-
+    d2.multiline_text((img.width//2, padding), wrapped, font=font, fill=(255,255,255,255),
+                      align="center", anchor="ma", spacing=6)
     out = str(OUT / f"cap_{uuid.uuid4().hex[:6]}.png")
     img.save(out)
     return out
 
-
 # =========================
-# BACKGROUND FETCH/PROCEDURAL
+# WIKIMEDIA FETCH PER SCENE
 # =========================
 COMMONS_ENDPOINT = "https://commons.wikimedia.org/w/api.php"
-KEYWORDS = [
-    "nebula", "galaxy", "desert night", "cathedral ruin",
-    "alien landscape", "stars", "eclipse", "ruins night", "cave dark",
-]
 
-
-def fetch_backgrounds(limit=10, timeout=12):
+def fetch_one_image(query: str, w=TARGET_W, timeout=10):
     params = {
-        "action": "query",
-        "format": "json",
-        "generator": "search",
-        "gsrsearch": "|".join(KEYWORDS),
-        "gsrlimit": str(limit),
-        "gsrnamespace": "6",
-        "prop": "imageinfo",
-        "iiprop": "url",
-        "iiurlwidth": str(TARGET_W),
+        "action":"query","format":"json","generator":"search",
+        "gsrsearch":query,"gsrlimit":"1","gsrnamespace":"6",
+        "prop":"imageinfo","iiprop":"url","iiurlwidth":str(w)
     }
     try:
-        r = requests.get(COMMONS_ENDPOINT, params=params, timeout=timeout)
-        r.raise_for_status()
-        data = r.json()
-        pages = data.get("query", {}).get("pages", {})
-        urls = []
+        r = requests.get(COMMONS_ENDPOINT, params=params, timeout=timeout); r.raise_for_status()
+        data = r.json(); pages = data.get("query", {}).get("pages", {})
         for _, p in pages.items():
             info = p.get("imageinfo", [{}])[0]
             url = info.get("thumburl") or info.get("url")
-            if url and url.lower().endswith((".jpg", ".jpeg", ".png")):
-                urls.append(url)
-
-        if not urls:
-            return 0
-
-        # eski overlayleri temizle
-        for f in OVERLAYS.glob("*.*"):
-            f.unlink(missing_ok=True)
-
-        ok = 0
-        for u in urls:
-            name = u.split("/")[-1].split("?")[0]
-            path = OVERLAYS / name
-            img = requests.get(u, timeout=timeout)
-            img.raise_for_status()
-            path.write_bytes(img.content)
-            ok += 1
-        return ok
+            if url and url.lower().endswith((".jpg",".jpeg",".png")):
+                raw = requests.get(url, timeout=timeout); raw.raise_for_status()
+                name = f"{uuid.uuid4().hex[:8]}_{query.replace(' ','_')}.jpg"
+                path = SCENE_ASSETS / name
+                path.write_bytes(raw.content)
+                return str(path)
     except Exception:
-        return 0
+        return None
+    return None
 
+def ensure_scene_images_for_line(line: str, need=2):
+    # her sahne için 2 görsel dene (dissolve ile akış)
+    queries = extract_keywords(line)
+    paths = []
+    for q in queries:
+        got = fetch_one_image(q)
+        if got: paths.append(got)
+        if len(paths) >= need: break
+    # yoksa prosedürel üret
+    while len(paths) < need:
+        tmp = SCENE_ASSETS / f"proc_{uuid.uuid4().hex[:6]}.jpg"
+        gen_procedural_still(tmp)
+        paths.append(str(tmp))
+    return paths[:need]
 
+# =========================
+# PROCEDURAL STILL
+# =========================
 def gen_procedural_still(path: Path, w=TARGET_W, h=TARGET_H):
     y, x = np.ogrid[:h, :w]
-    cy, cx = h / 2, w / 2
-    r = np.sqrt(((x - cx) / (w / 2)) ** 2 + ((y - cy) / (h / 2)) ** 2)
-    band = (np.sin(r * 10) * 0.5 + 0.5) * 180 + 30
+    cy, cx = h/2, w/2
+    r = np.sqrt(((x-cx)/(w/2))**2 + ((y-cy)/(h/2))**2)
+    band = (np.sin(r*10)*0.5+0.5)*180 + 30
     noise = np.random.normal(0, 6, (h, w))
-    img = np.clip(band + noise, 0, 255).astype(np.uint8)
+    img = np.clip(band+noise, 0, 255).astype(np.uint8)
     im = Image.fromarray(img).convert("RGB").filter(ImageFilter.GaussianBlur(1.2))
-    # hafif vignette
-    vign = Image.new("L", (w, h), 0)
-    vd = ImageDraw.Draw(vign)
-    vd.ellipse((-int(w*0.2), -int(h*0.2), int(w*1.2), int(h*1.2)), fill=255)
+    # vignette
+    vign = Image.new("L",(w,h),0); vd = ImageDraw.Draw(vign)
+    vd.ellipse((-int(w*0.2),-int(h*0.2),int(w*1.2),int(h*1.2)), fill=255)
     vign = vign.filter(ImageFilter.GaussianBlur(80))
     im.putalpha(vign)
-    # arkaplan siyah ile birleştir
-    bg = Image.new("RGB", (w, h), (8, 8, 10))
-    bg.paste(im, mask=im.split()[-1])
+    bg = Image.new("RGB",(w,h),(8,8,10)); bg.paste(im, mask=im.split()[-1])
     bg.save(path)
 
-
-def ensure_backgrounds(min_count=8):
-    count = fetch_backgrounds(limit=max(min_count, 10))
-    files = list(OVERLAYS.glob("*.jpg")) + list(OVERLAYS.glob("*.png"))
-    if len(files) >= min_count:
-        return
-    need = min_count - len(files)
-    for i in range(need):
-        gen_procedural_still(OVERLAYS / f"proc_{i}.jpg")
-
-
 # =========================
-# VIDEO SCENES
+# SCENE BUILDERS
 # =========================
-def scene_from_img(path: Path, dur: float):
-    clip = ImageClip(str(path)).resize(height=TARGET_H).set_duration(dur)
+def kenburns_clip(img_path: str, dur: float):
+    clip = ImageClip(img_path).resize(height=TARGET_H).set_duration(dur)
     w, h = clip.size
-    # yumuşak zoom-in
-    return clip.fx(crop, x1=0, y1=0, x2=w, y2=h).resize(lambda t: 1.02 + 0.01 * t)
+    # hafif pan/zoom (random yön)
+    z = clip.fx(crop, x1=0, y1=0, x2=w, y2=h).resize(lambda t: 1.03 + 0.01 * t)
+    return z
 
-
-def scene_procedural(dur: float):
-    # Kare başı numpy üretimi pahalı; burada sabit procedural still + yavaş zoom:
-    tmp = OVERLAYS / f"proc_static_{uuid.uuid4().hex[:6]}.jpg"
-    gen_procedural_still(tmp)
-    return scene_from_img(tmp, dur)
-
+def scene_from_images(img_paths, dur: float):
+    # 2 görsel → her biri yarım süre, 0.5 sn crossfade
+    if len(img_paths) == 1:
+        return kenburns_clip(img_paths[0], dur)
+    half = max(0.8, (dur/2.0))
+    a = kenburns_clip(img_paths[0], half)
+    b = kenburns_clip(img_paths[1], half).crossfadein(0.6)
+    return concatenate_videoclips([a, b], method="compose").set_duration(dur)
 
 # =========================
-# YOUTUBE UPLOAD
+# YOUTUBE
 # =========================
 def youtube_service():
     client_id = os.getenv("YOUTUBE_CLIENT_ID")
@@ -347,16 +305,12 @@ def youtube_service():
     refresh_token = os.getenv("YOUTUBE_REFRESH_TOKEN")
     token_uri = "https://oauth2.googleapis.com/token"
     creds = Credentials(
-        None,
-        refresh_token=refresh_token,
-        token_uri=token_uri,
-        client_id=client_id,
-        client_secret=client_secret,
+        None, refresh_token=refresh_token, token_uri=token_uri,
+        client_id=client_id, client_secret=client_secret,
         scopes=["https://www.googleapis.com/auth/youtube.upload"],
     )
     creds.refresh(Request())
     return build("youtube", "v3", credentials=creds)
-
 
 def upload_to_youtube(path_mp4, title, desc, tags):
     youtube = youtube_service()
@@ -367,81 +321,70 @@ def upload_to_youtube(path_mp4, title, desc, tags):
     media = MediaFileUpload(path_mp4, chunksize=-1, resumable=True)
     return youtube.videos().insert(part=",".join(body.keys()), body=body, media_body=media).execute().get("id")
 
-
 # =========================
 # ORCHESTRATOR
 # =========================
 def run_pipeline():
     uid = uuid.uuid4().hex[:6]
 
-    # 1) Metin (daha dramatik uzun form)
-    script_text, scene_caps = make_script_longform()
+    # 1) Metin + sahne başlıkları
+    full_text, caps_all = make_script_longform()
+    # Sahne sayısını sınırla
+    target_scene_count = max(5, min(len(caps_all), random.randint(SCENES_MIN, SCENES_MAX)))
+    caps = caps_all[:target_scene_count]
 
-    # 2) TTS (ham) + ses tasarım
-    raw_path = str(OUT / f"narr_{uid}.mp3")
-    gTTS(text=script_text, lang="en").save(raw_path)
-    voice_path = tts_and_design(script_text, raw_path)
+    # 2) TTS her sahne için ayrı → concat → süre listesi
+    voice_path, durations, per_chunk = tts_chunks_and_concatenate(caps)
+    total_voice_sec = sum(durations)
+    # Üst sınır uygula (gerekirse son sahneyi kısalt)
+    if total_voice_sec > VIDEO_DURATION_CAP:
+        overflow = total_voice_sec - VIDEO_DURATION_CAP
+        # son sahnenin süresini kıs
+        if durations[-1] > overflow + 1.0:
+            durations[-1] -= overflow
+            total_voice_sec = VIDEO_DURATION_CAP
+        else:
+            # aşırı durumda son sahneyi tamamen düş
+            durations.pop(); caps.pop()
+            total_voice_sec = sum(durations)
 
-    # Gerçek ses süresi (sn) → sahneleri buna göre böleceğiz
-    voice_ms = len(AudioSegment.from_file(voice_path))
-    voice_sec = max(10, voice_ms // 1000)  # alt sınır 10 sn
-    scene_count = max(5, min(len(scene_caps), random.randint(SCENES_MIN, SCENES_MAX)))
-    per_scene = voice_sec / scene_count
+    # 3) Her sahne metnine göre görselleri indir/oluştur
+    all_scene_clips = []
+    t_cursor = 0.0
+    for i, (cap, dur) in enumerate(zip(caps, durations)):
+        imgs = ensure_scene_images_for_line(cap, need=2)
+        base = scene_from_images(imgs, dur).set_start(t_cursor)
 
-    # 3) Arkaplanları garanti et
-    ensure_backgrounds(min_count=8)
-    bg_files = list(OVERLAYS.glob("*.jpg")) + list(OVERLAYS.glob("*.png"))
-
-    # 4) Zaman çizelgesi — her sahneyi START/END ile yerleştir (senkron altyazı)
-    timeline_elements = []
-    for i in range(scene_count):
-        start_t = i * per_scene
-        dur = per_scene
-
-        base = (scene_from_img(random.choice(bg_files), dur) if bg_files else scene_procedural(dur)).set_start(start_t)
-
-        cap = scene_caps[i % len(scene_caps)]
         cap_img = caption_png(cap, width=900)
-        cap_clip = (
-            ImageClip(cap_img)
-            .set_duration(dur)
-            .set_start(start_t)
-            .set_position(("center", "center"))
-        )
+        cap_clip = ImageClip(cap_img).set_duration(dur).set_start(t_cursor).set_position(("center","center"))
 
-        timeline_elements.append(base)
-        timeline_elements.append(cap_clip)
+        all_scene_clips += [base, cap_clip]
+        t_cursor += dur
 
-    # 5) Composite + Ses
-    timeline = CompositeVideoClip(timeline_elements, size=(TARGET_W, TARGET_H))
+    # 4) Composite + Audio
+    timeline = CompositeVideoClip(all_scene_clips, size=(TARGET_W, TARGET_H))
     aclip = AudioFileClip(voice_path)
-    # Sesin süresini baz al; video süresi maksimum VIDEO_DURATION ile sınırla (gerekirse kısalt)
-    total_dur = min(voice_sec, VIDEO_DURATION)
-    timeline = timeline.set_audio(aclip).set_duration(total_dur)
+    timeline = timeline.set_audio(aclip).set_duration(total_voice_sec)
 
-    # 6) Render (hız/kalite dengesi)
+    # 5) Render (hız/kalite dengesi)
     mp4 = str(OUT / f"signal_auto_{uid}.mp4")
     timeline.write_videofile(
-        mp4,
-        fps=24,
-        codec="libx264",
-        audio_codec="aac",
-        bitrate="2500k",
-        threads=2,
-        ffmpeg_params=["-preset", "veryfast", "-tune", "stillimage"],
+        mp4, fps=24, codec="libx264", audio_codec="aac",
+        bitrate="2500k", threads=2,
+        ffmpeg_params=["-preset", "veryfast", "-tune", "stillimage"]
     )
 
-    # 7) Seed evrimi
-    evolve_and_store(scene_caps)
+    # 6) Seed evrimi
+    evolve_and_store(caps)
 
-    # 8) YouTube upload
+    # 7) YouTube upload
     n = datetime.utcnow().strftime("%Y-%m-%d")
     title = f"SIGNAL ARCHIVE — {n} — {random.choice(['The Pulse Beneath','Whisper Archive','Eclipsera'])}"
     desc = (
         "From the T-3012 archives. God is not gone. He's buried.\n\n"
         "Automated longform transmission."
     )
-    tags = ["godfinders", "ai", "cosmic horror", "existential", "shorts"]
+    tags = ["godfinders","ai","cosmic horror","existential","longform"]
 
     vid = upload_to_youtube(mp4, title, desc, tags)
     print("Uploaded video ID:", vid)
