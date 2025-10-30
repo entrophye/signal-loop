@@ -15,7 +15,7 @@ from moviepy.editor import (
     ImageClip, AudioFileClip, CompositeVideoClip, VideoClip,
     concatenate_videoclips
 )
-from moviepy.video.fx.all import crop, crossfadein
+from moviepy.video.fx.all import crop, fadein  # crossfadein yok, MoviePy 1.0.3 uyumu
 
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
@@ -115,7 +115,6 @@ def make_script_longform():
     pieces = [hook] + discovery + escalation + revelation + [tag]
     full = " ".join(" ".join(pieces).split())
     if len(full) > 900: full = full[:897] + "…"
-    # sahne başlıkları
     caps = [hook] + [s if len(s) <= 90 else s[:87]+"…" for s in (discovery+escalation+revelation)] + [tag]
     return full, caps
 
@@ -139,7 +138,7 @@ def extract_keywords(line: str):
             qs += choices
     if not qs:
         qs = ["eclipse", "alien landscape", "ruins night", "galaxy", "nebula"]
-    return list(dict.fromkeys(qs))[:3]  # en fazla 3 arama
+    return list(dict.fromkeys(qs))[:3]
 
 # =========================
 # AUDIO DESIGN (PER-CHUNK)
@@ -171,14 +170,12 @@ def tts_chunks_and_concatenate(lines):
         seg = AudioSegment.from_file(path).set_channels(1).set_frame_rate(44100)
         seg = _pitch_down(seg, -2.5)
         seg = _echo(seg, 200, -9)
-        # kısa parçaları minimum 3 sn’e uzat
         if len(seg) < 3000:
             seg = seg + AudioSegment.silent(duration=3000 - len(seg))
         seg.export(path, format="mp3")
         chunk_paths.append(str(path))
         durations.append(len(seg) / 1000.0)
 
-    # birleşik + drone tabanı
     combined = AudioSegment.silent(duration=0)
     for p in chunk_paths:
         combined += AudioSegment.from_file(p)
@@ -243,24 +240,6 @@ def fetch_one_image(query: str, w=TARGET_W, timeout=10):
         return None
     return None
 
-def ensure_scene_images_for_line(line: str, need=2):
-    # her sahne için 2 görsel dene (dissolve ile akış)
-    queries = extract_keywords(line)
-    paths = []
-    for q in queries:
-        got = fetch_one_image(q)
-        if got: paths.append(got)
-        if len(paths) >= need: break
-    # yoksa prosedürel üret
-    while len(paths) < need:
-        tmp = SCENE_ASSETS / f"proc_{uuid.uuid4().hex[:6]}.jpg"
-        gen_procedural_still(tmp)
-        paths.append(str(tmp))
-    return paths[:need]
-
-# =========================
-# PROCEDURAL STILL
-# =========================
 def gen_procedural_still(path: Path, w=TARGET_W, h=TARGET_H):
     y, x = np.ogrid[:h, :w]
     cy, cx = h/2, w/2
@@ -269,7 +248,6 @@ def gen_procedural_still(path: Path, w=TARGET_W, h=TARGET_H):
     noise = np.random.normal(0, 6, (h, w))
     img = np.clip(band+noise, 0, 255).astype(np.uint8)
     im = Image.fromarray(img).convert("RGB").filter(ImageFilter.GaussianBlur(1.2))
-    # vignette
     vign = Image.new("L",(w,h),0); vd = ImageDraw.Draw(vign)
     vd.ellipse((-int(w*0.2),-int(h*0.2),int(w*1.2),int(h*1.2)), fill=255)
     vign = vign.filter(ImageFilter.GaussianBlur(80))
@@ -277,24 +255,47 @@ def gen_procedural_still(path: Path, w=TARGET_W, h=TARGET_H):
     bg = Image.new("RGB",(w,h),(8,8,10)); bg.paste(im, mask=im.split()[-1])
     bg.save(path)
 
+def ensure_scene_images_for_line(line: str, need=2):
+    queries = extract_keywords(line)
+    paths = []
+    for q in queries:
+        got = fetch_one_image(q)
+        if got: paths.append(got)
+        if len(paths) >= need: break
+    while len(paths) < need:
+        tmp = SCENE_ASSETS / f"proc_{uuid.uuid4().hex[:6]}.jpg"
+        gen_procedural_still(tmp)
+        paths.append(str(tmp))
+    return paths[:need]
+
 # =========================
 # SCENE BUILDERS
 # =========================
 def kenburns_clip(img_path: str, dur: float):
     clip = ImageClip(img_path).resize(height=TARGET_H).set_duration(dur)
     w, h = clip.size
-    # hafif pan/zoom (random yön)
     z = clip.fx(crop, x1=0, y1=0, x2=w, y2=h).resize(lambda t: 1.03 + 0.01 * t)
     return z
 
 def scene_from_images(img_paths, dur: float):
-    # 2 görsel → her biri yarım süre, 0.5 sn crossfade
+    """
+    2 görsel → her biri yarım süre.
+    İkincisi ~0.6 sn 'fade-in' alır ve bir öncekinin son 0.6 sn'si üzerine bindirilir
+    → MoviePy 1.0.3 ile yumuşak crossfade etkisi.
+    """
     if len(img_paths) == 1:
         return kenburns_clip(img_paths[0], dur)
-    half = max(0.8, (dur/2.0))
-    a = kenburns_clip(img_paths[0], half)
-    b = kenburns_clip(img_paths[1], half).crossfadein(0.6)
-    return concatenate_videoclips([a, b], method="compose").set_duration(dur)
+
+    half = max(0.8, (dur / 2.0))
+    xfade = min(0.6, half * 0.4)
+
+    a = kenburns_clip(img_paths[0], half).set_start(0)
+    b = kenburns_clip(img_paths[1], half)
+    b = fadein(b, xfade).set_start(half - xfade)
+
+    comp = CompositeVideoClip([a, b], size=(TARGET_W, TARGET_H))
+    comp = comp.set_duration(half + half)
+    return comp
 
 # =========================
 # YOUTUBE
@@ -329,26 +330,22 @@ def run_pipeline():
 
     # 1) Metin + sahne başlıkları
     full_text, caps_all = make_script_longform()
-    # Sahne sayısını sınırla
     target_scene_count = max(5, min(len(caps_all), random.randint(SCENES_MIN, SCENES_MAX)))
     caps = caps_all[:target_scene_count]
 
     # 2) TTS her sahne için ayrı → concat → süre listesi
     voice_path, durations, per_chunk = tts_chunks_and_concatenate(caps)
     total_voice_sec = sum(durations)
-    # Üst sınır uygula (gerekirse son sahneyi kısalt)
     if total_voice_sec > VIDEO_DURATION_CAP:
         overflow = total_voice_sec - VIDEO_DURATION_CAP
-        # son sahnenin süresini kıs
         if durations[-1] > overflow + 1.0:
             durations[-1] -= overflow
             total_voice_sec = VIDEO_DURATION_CAP
         else:
-            # aşırı durumda son sahneyi tamamen düş
             durations.pop(); caps.pop()
             total_voice_sec = sum(durations)
 
-    # 3) Her sahne metnine göre görselleri indir/oluştur
+    # 3) Her sahneye uygun görselleri getir
     all_scene_clips = []
     t_cursor = 0.0
     for i, (cap, dur) in enumerate(zip(caps, durations)):
@@ -366,7 +363,7 @@ def run_pipeline():
     aclip = AudioFileClip(voice_path)
     timeline = timeline.set_audio(aclip).set_duration(total_voice_sec)
 
-    # 5) Render (hız/kalite dengesi)
+    # 5) Render
     mp4 = str(OUT / f"signal_auto_{uid}.mp4")
     timeline.write_videofile(
         mp4, fps=24, codec="libx264", audio_codec="aac",
@@ -377,9 +374,8 @@ def run_pipeline():
     # 6) Seed evrimi
     evolve_and_store(caps)
 
-    # 7) YouTube upload
-    n = datetime.utcnow().strftime("%Y-%m-%d")
-    title = f"SIGNAL ARCHIVE — {n} — {random.choice(['The Pulse Beneath','Whisper Archive','Eclipsera'])}"
+    # 7) YouTube upload — TARİH YOK, sadece başlık
+    title = f"SIGNAL ARCHIVE — {random.choice(['The Pulse Beneath','Whisper Archive','Eclipsera'])}"
     desc = (
         "From the T-3012 archives. God is not gone. He's buried.\n\n"
         "Automated longform transmission."
