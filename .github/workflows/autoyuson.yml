@@ -32,23 +32,20 @@ jobs:
         run: |
           python -V
           python -m pip install --upgrade pip setuptools wheel
-          # numpy 2.x ile moviepy eski sürümlerde sorun çıkabiliyor, bu yüzden 1.26.x
           python -m pip install --no-cache-dir numpy==1.26.4
-          # imageio ve ffmpeg köprüsü
           python -m pip install --no-cache-dir imageio==2.31.1 imageio-ffmpeg==0.4.8
-          # Kararlı moviepy sürümü
           python -m pip install --no-cache-dir moviepy==1.0.3
-          # Diğer bağımlılıklar
           python -m pip install --no-cache-dir gTTS pillow requests wikipedia \
             google-api-python-client google-auth-httplib2 google-auth-oauthlib
-          # Kurulum doğrulama
+          # ✅ Doğru doğrulama
           python - << 'PY'
-          import sys
+          import sys, moviepy, imageio, numpy
+          import moviepy.editor as m
           print("Python:", sys.version)
-          import moviepy.editor as m, imageio, numpy, PIL, gtts, requests, wikipedia
-          print("moviepy:", m.__version__)
+          print("moviepy:", moviepy.__version__)
           print("imageio:", imageio.__version__)
           print("numpy:", numpy.__version__)
+          print("editor OK:", hasattr(m, "VideoFileClip"))
           PY
 
       - name: Run Autoyuson
