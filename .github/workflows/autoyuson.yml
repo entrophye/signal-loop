@@ -75,7 +75,7 @@ jobs:
                       if not data.get("refresh_token"):
                           print("ERROR: TOKEN_JSON_BASE64 present but no refresh_token in JSON.")
                           ok = False
-                  except Exception as e:
+                  except Exception:
                       print("ERROR: TOKEN_JSON_BASE64 invalid.")
                       ok = False
           if not ok:
@@ -92,16 +92,15 @@ jobs:
           LANGUAGE: "en"
           VIDEO_DURATION: "55"
           TITLE_PREFIX: ""
+          CONTENT_THEME: "FACTUAL_SHORTS"
         run: |
           python main_autoyuson.py
 
+      # ⬇️ Shell script yerine güvenilir auto-commit action
       - name: Commit seen topics (if changed)
-        run: |
-          git config user.name "autoyuson-bot"
-          git config user.email "autoyuson@users.noreply.github.com"
-          git add data/seen_topics.json || true
-          if ! git diff --cached --quiet; then
-            git commit -m "autoyuson: update seen topics"
-            git push
-          else
-            echo "No changes to commit."
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "autoyuson: update seen topics"
+          file_pattern: data/seen_topics.json
+          commit_user_name: autoyuson-bot
+          commit_user_email: autoyuson@users.noreply.github.com
