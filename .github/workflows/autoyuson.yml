@@ -3,7 +3,7 @@ name: Autoyuson — Factual Shorts
 on:
   workflow_dispatch:
   schedule:
-    - cron: "17 13 * * *"  # her gün 16:17 (+03)
+    - cron: "17 13 * * *"
 
 permissions:
   contents: write
@@ -11,6 +11,7 @@ permissions:
 jobs:
   build-and-upload:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -22,16 +23,25 @@ jobs:
         with:
           python-version: "3.11"
 
-      # Sadece ffmpeg; ImageMagick KALDIRILDI
       - name: Install ffmpeg
         run: |
-          sudo apt-get update
+          sudo apt-get update -y
           sudo apt-get install -y ffmpeg
 
-      - name: Install Python deps
+      # 🔧 Zorla moviepy kurulumu (önce pip upgrade)
+      - name: Install Python dependencies
         run: |
-          python -m pip install --upgrade pip
-          pip install google-api-python-client google-auth-httplib2 google-auth-oauthlib moviepy gTTS pillow requests wikipedia
+          python -m pip install --upgrade pip setuptools wheel
+          pip install --force-reinstall moviepy
+          pip install gTTS pillow requests wikipedia google-api-python-client google-auth-httplib2 google-auth-oauthlib
+
+      # Kontrol: gerçekten yüklenmiş mi?
+      - name: Verify installation
+        run: |
+          python - << 'PY'
+          import moviepy.editor, gtts, PIL, requests, wikipedia
+          print("✅ MoviePy and all deps installed.")
+          PY
 
       - name: Run Autoyuson
         env:
@@ -41,9 +51,7 @@ jobs:
           LANGUAGE: "en"
           VIDEO_DURATION: "55"
           TITLE_PREFIX: ""
-          CONTENT_THEME: "FACTUAL_SHORTS"
-        run: |
-          python main_autoyuson.py
+        run: python main_autoyuson.py
 
       - name: Commit seen topics (if changed)
         run: |
