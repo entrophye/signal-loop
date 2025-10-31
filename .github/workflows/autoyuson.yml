@@ -1,0 +1,57 @@
+name: Autoyuson — Factual Shorts
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 13 * * *"  # Her gün 16:17 (+03:00 İstanbul) civarı; istersen değiştir
+
+permissions:
+  contents: write  # seen_topics.json'i commitlemek için
+
+jobs:
+  build-and-upload:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install ffmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install google-api-python-client google-auth-httplib2 google-auth-oauthlib moviepy gTTS pillow requests wikipedia
+
+      - name: Run Autoyuson
+        env:
+          YT_CLIENT_ID: ${{ secrets.YT_CLIENT_ID }}
+          YT_CLIENT_SECRET: ${{ secrets.YT_CLIENT_SECRET }}
+          YT_REFRESH_TOKEN: ${{ secrets.YT_REFRESH_TOKEN }}
+          LANGUAGE: "en"
+          VIDEO_DURATION: "55"
+          TITLE_PREFIX: ""
+          CONTENT_THEME: "FACTUAL_SHORTS"
+        run: |
+          python main_autoyuson.py
+
+      - name: Commit seen topics (if changed)
+        run: |
+          git config user.name "autoyuson-bot"
+          git config user.email "autoyuson@users.noreply.github.com"
+          git add data/seen_topics.json || true
+          if ! git diff --cached --quiet; then
+            git commit -m "autoyuson: update seen topics"
+            git push
+          else
+            echo "No changes to commit."
+          fi
