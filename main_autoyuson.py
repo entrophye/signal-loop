@@ -1,35 +1,43 @@
+# -*- coding: utf-8 -*-
 """
-AUTOYUSON — Factual Shorts (History / Space / Culture) for Yusonvasya
+AUTOYUSON — Cinematic Factual Shorts (History / Space / Culture)
 
-İyileştirmeler:
-- Metin: Hook → Dense Facts → Closure (factual, ilgi çekici)
-- Ses: Edge-TTS + SSML (narration-professional, rate +4%, pitch -2%) → fallback gTTS
-- Altyazı: Edge WordBoundary ile mini-chunk senkron; yoksa akıcı tahmin
-- Altyazı okunabilirliği: yarı saydam arka plan şeridi
-- Görsel: Tek görselde tam süre Ken Burns; çok görselde crossfade
-- Ambiyans: assets/ambience.mp3 varsa kullan; yoksa procedural drone (çok düşük volüm)
+V3 ana farklar:
+- Beat sheet metin: cold open → hook → 3 fact → close
+- Edge-TTS + SSML (narration-relaxed, rate -3%, pitch -2%), gTTS fallback
+- Pydub ile mastering: HPF 120 Hz, LPF 8 kHz, hafif kompresyon, de-ess benzeri yumuşatma
+- Ambiyans müziği + otomatik ducking (konuşma sırasında 0.12 vol, aralarda 0.20 vol)
+- Görsel sinema dokusu: Ken Burns, crossfade, vignette, warm grade, film-grain
+- Mini-chunk kelime senkron altyazı
 
-ENV (GitHub Secrets veya local):
+Gerekli ENV:
   YT_CLIENT_ID, YT_CLIENT_SECRET, YT_REFRESH_TOKEN
-  # Yedek:
-  TOKEN_JSON_BASE64   (token.json base64; içinde refresh_token + client_id + client_secret)
+  (veya TOKEN_JSON_BASE64 içinde refresh_token + client_id + client_secret)
 
 Opsiyonel:
   LANGUAGE=en
   VIDEO_DURATION=55
   TITLE_PREFIX=
   TOPICS_FILE=topics.txt
-  EDGE_TTS_VOICE=en-US-JennyNeural  # daha doğal
+  EDGE_TTS_VOICE=en-US-JennyNeural
 """
 
-import os, io, re, json, base64, random, textwrap, pathlib, sys, asyncio, urllib.parse
+import os, io, re, json, base64, random, textwrap, pathlib, sys, asyncio, urllib.parse, math
 from typing import List, Tuple, Optional
 from dataclasses import dataclass
 
 import requests
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageFilter, ImageOps
+import numpy as np
+from gtts import gTTS
+from moviepy.editor import (ImageClip, AudioFileClip, CompositeVideoClip,
+                            CompositeAudioClip, afx, ColorClip)
+from moviepy.video.fx.all import resize as mp_resize
+from googleapiclient.discovery import build
+from google.oauth2.credentials import Credentials
+from google.auth.transport.requests import Request
 
-# Pillow 10+ uyumluluk
+# Pillow ANTIALIAS uyumluluğu
 try:
     _ = Image.ANTIALIAS  # type: ignore[attr-defined]
 except AttributeError:
@@ -38,15 +46,6 @@ except AttributeError:
     except Exception:
         pass
 
-import numpy as np
-from gtts import gTTS
-from moviepy.editor import (ImageClip, AudioFileClip, CompositeVideoClip,
-                            CompositeAudioClip, afx)
-from moviepy.video.fx.all import resize as mp_resize
-from googleapiclient.discovery import build
-from google.oauth2.credentials import Credentials
-from google.auth.transport.requests import Request
-
 # ---------- Config ----------
 LANG = os.getenv("LANGUAGE", "en").strip() or "en"
 DURATION_TARGET = int(os.getenv("VIDEO_DURATION", "55"))
@@ -54,7 +53,7 @@ TITLE_PREFIX = os.getenv("TITLE_PREFIX", "").strip()
 YOUTUBE_CATEGORY_ID = "27"
 DEFAULT_TAGS = ["history", "space", "astronomy", "archaeology", "culture", "documentary", "facts", "shorts"]
 TOPICS_FILE = os.getenv("TOPICS_FILE", "topics.txt")
-EDGE_TTS_VOICE = os.getenv("EDGE_TTS_VOICE", "en-US-JennyNeural")  # daha doğal hissiyat
+EDGE_TTS_VOICE = os.getenv("EDGE_TTS_VOICE", "en-US-JennyNeural")
 
 DATA_DIR = pathlib.Path("data"); DATA_DIR.mkdir(parents=True, exist_ok=True)
 SEEN_PATH = DATA_DIR / "seen_topics.json"
@@ -65,7 +64,7 @@ W, H = 1080, 1920
 WIKI = "https://en.wikipedia.org"
 REST = f"{WIKI}/api/rest_v1"
 API  = f"{WIKI}/w/api.php"
-UA = {"User-Agent": "autoyuson-bot/1.2 (+github)"}
+UA = {"User-Agent": "autoyuson-bot/1.3 (+github)"}
 
 CURATED_TOPICS = [
     "Rosetta Stone","Dead Sea Scrolls","Hagia Sophia","Voyager Golden Record","Terracotta Army","Göbekli Tepe",
@@ -77,8 +76,9 @@ CURATED_TOPICS = [
 
 # ---------- Seen topics ----------
 def load_seen() -> List[str]:
-    if SEEN_PATH.exists():
-        try: return json.loads(SEEN_PATH.read_text(encoding="utf-8"))
+    p = SEEN_PATH
+    if p.exists():
+        try: return json.loads(p.read_text(encoding="utf-8"))
         except Exception: return []
     return []
 
@@ -102,55 +102,50 @@ def pick_topic(seen: List[str]) -> str:
 
 # ---------- Wikipedia (REST) ----------
 def _rest_summary(title: str):
-    url = f"{REST}/page/summary/{urllib.parse.quote(title)}"
+    import urllib.parse as up
+    url = f"{REST}/page/summary/{up.quote(title)}"
     r = requests.get(url, headers=UA, timeout=20)
-    if r.status_code != 200:
-        return None
-    return r.json()
+    return r.json() if r.status_code == 200 else None
 
 def _rest_media(title: str):
-    url = f"{REST}/page/media/{urllib.parse.quote(title)}"
+    import urllib.parse as up
+    url = f"{REST}/page/media/{up.quote(title)}"
     r = requests.get(url, headers=UA, timeout=20)
-    if r.status_code != 200:
-        return None
-    return r.json()
+    return r.json() if r.status_code == 200 else None
 
 def _opensearch(q: str) -> List[str]:
     r = requests.get(API, headers=UA, timeout=20, params={
-        "action": "opensearch", "search": q, "limit": 5, "namespace": 0, "format": "json"
+        "action":"opensearch","search":q,"limit":5,"namespace":0,"format":"json"
     })
-    if r.status_code != 200:
-        return []
+    if r.status_code != 200: return []
     data = r.json()
-    return data[1] if isinstance(data, list) and len(data) >= 2 else []
+    return data[1] if isinstance(data, list) and len(data)>=2 else []
 
 def wiki_fetch(topic: str):
-    cand_titles = [topic] + _opensearch(topic)
-    for cand in cand_titles:
+    cands = [topic] + _opensearch(topic)
+    for cand in cands:
         s = _rest_summary(cand)
         if not s: continue
         title = s.get("title") or cand
         extract = s.get("extract") or ""
-        page_url = s.get("content_urls", {}).get("desktop", {}).get("page") or f"{WIKI}/wiki/{urllib.parse.quote(title.replace(' ','_'))}"
-        imgs: List[str] = []
+        page_url = s.get("content_urls",{}).get("desktop",{}).get("page") or f"{WIKI}/wiki/{title.replace(' ','_')}"
+        imgs=[]
         m = _rest_media(title)
         if m and "items" in m:
             for it in m["items"]:
-                if it.get("type") != "image": continue
-                src = None
-                if it.get("srcset"):
-                    src = sorted(it["srcset"], key=lambda x: x.get("scale",1.0))[-1].get("src")
-                if not src: src = it.get("src")
-                if not src: continue
-                low = str(src).lower()
+                if it.get("type")!="image": continue
+                src = (it.get("srcset") or [])
+                src = sorted(src, key=lambda x: x.get("scale",1.0))
+                url = (src[-1]["src"] if src else it.get("src")) or ""
+                low=url.lower()
                 if any(b in low for b in ["logo","icon","flag","seal","map","diagram","coat_of_arms","favicon","sprite"]): continue
                 if not low.endswith((".jpg",".jpeg",".png",".webp")): continue
-                imgs.append(src)
-        thumb = s.get("thumbnail", {}).get("source")
-        if thumb: imgs = [thumb] + imgs
+                imgs.append(url)
+        thumb = s.get("thumbnail",{}).get("source")
+        if thumb: imgs=[thumb]+imgs
         if extract:
             return title, extract, page_url, imgs[:8]
-    raise RuntimeError(f"Wiki fetch failed for topic: {topic}")
+    raise RuntimeError("Wiki fetch failed")
 
 def download_image(url: str) -> Optional[Image.Image]:
     try:
@@ -159,430 +154,371 @@ def download_image(url: str) -> Optional[Image.Image]:
     except Exception:
         return None
 
-# ---------- Script (hook → facts → close) ----------
-def craft_script(title: str, summary: str) -> Tuple[str, str, List[str]]:
-    # kanca için yıl/ölçü yakala
-    years = re.findall(r"(1[0-9]{3}|20[0-9]{2})", summary)
-    nums  = re.findall(r"\b([0-9]+(?:\.[0-9]+)?)(?:\s?(?:km|m|kg|years?|%|million|billion))?\b", summary, flags=re.I)
-    hook_bits = []
-    if years: hook_bits.append(years[0])
-    if nums:  hook_bits.append(nums[0])
-    hook = f"{title}: {', '.join(hook_bits)} — evidence that changed what we thought we knew." if hook_bits else f"{title}: evidence that changed what we thought we knew."
-
-    # temiz metin
-    txt = re.sub(r"\s+", " ", summary).strip()
-    words = txt.split()
-    body = " ".join(words[:120]) if len(words) > 120 else (txt if len(words) >= 80 else (txt + " " + " ".join((words+words)[:80])))
-
-    close = "In history, what endures is what we can verify — and what it reveals."
-    narration = f"{hook} {body} {close}"
-    sentences = [s.strip() for s in re.split(r'(?<=[.!?])\s+', narration) if s.strip()]
+# ---------- Script (Beat Sheet) ----------
+def craft_script(title: str, summary: str):
+    clean = re.sub(r"\s+"," ", summary).strip()
+    years = re.findall(r"(1[0-9]{3}|20[0-9]{2})", clean)
+    numbers = re.findall(r"\b\d[\d,\.]*\b", clean)
+    # Beats
+    cold_open = f"{title}. Verified, preserved, undeniable."
+    hook = f"What changed our understanding? Evidence — not legend."
+    fact1 = " ".join(clean.split()[:40])
+    fact2 = " ".join(clean.split()[40:80]) or clean
+    fact3 = " ".join(clean.split()[80:120]) or clean
+    close = "History survives by proof — and by those who keep looking."
+    sentences = [cold_open, hook, fact1, fact2, fact3, close]
+    narration = " ".join(sentences)
     return narration, title, sentences
 
-def is_factual_enough(text: str) -> bool:
-    bad = ["reportedly","allegedly","some say","legend has it","it is said","rumor"]
-    if any(w in text.lower() for w in bad): return False
-    n = len(text.split()); return 80 <= n <= 240
+def is_factual(text:str)->bool:
+    if any(w in text.lower() for w in ["reportedly","allegedly","legend","rumor"]): return False
+    n=len(text.split()); return 80<=n<=260
 
-# ---------- Fonts / Text PNG ----------
-N_REG = FONTS_DIR / "NotoSans-Regular.ttf"
-N_BOLD = FONTS_DIR / "NotoSans-Bold.ttf"
-
+# ---------- Fonts & Text ----------
+FONTS = {
+    "reg": FONTS_DIR/"NotoSans-Regular.ttf",
+    "bold":FONTS_DIR/"NotoSans-Bold.ttf",
+}
 def ensure_fonts():
-    srcs = {
-        N_REG: "https://github.com/googlefonts/noto-fonts/raw/main/hinted/ttf/NotoSans/NotoSans-Regular.ttf",
-        N_BOLD:"https://github.com/googlefonts/noto-fonts/raw/main/hinted/ttf/NotoSans/NotoSans-Bold.ttf"
+    urls={
+        FONTS["reg"]:"https://github.com/googlefonts/noto-fonts/raw/main/hinted/ttf/NotoSans/NotoSans-Regular.ttf",
+        FONTS["bold"]:"https://github.com/googlefonts/noto-fonts/raw/main/hinted/ttf/NotoSans/NotoSans-Bold.ttf",
     }
-    for path, url in srcs.items():
-        if not path.exists():
+    for p,u in urls.items():
+        if not p.exists():
             try:
-                r = requests.get(url, headers=UA, timeout=30); r.raise_for_status()
-                path.write_bytes(r.content)
-            except Exception:
-                pass
+                r=requests.get(u,headers=UA,timeout=30); r.raise_for_status()
+                p.write_bytes(r.content)
+            except Exception: pass
 
-def get_font(size=48, bold=False):
-    try:
-        return ImageFont.truetype(str(N_BOLD if bold else N_REG), size=size)
-    except Exception:
-        return ImageFont.load_default()
+def font(size=48,bold=False):
+    try: return ImageFont.truetype(str(FONTS["bold" if bold else "reg"]), size=size)
+    except Exception: return ImageFont.load_default()
 
-def draw_text_with_bg(width: int, lines: List[str], fontsize: int, bold: bool=False,
-                      fg=(255,255,255), bg=(0,0,0,140), pad=14, radius=18) -> Image.Image:
-    font = get_font(size=fontsize, bold=bold)
-    draw = ImageDraw.Draw(Image.new("RGB",(10,10)))
-    line_w = [draw.textsize(ln, font=font)[0] for ln in lines]
-    ascent, descent = font.getmetrics()
-    lh = ascent + descent + 6
-    box_w = min(width, max(line_w) + pad*2)
-    box_h = lh*len(lines) + pad*2
-    img = Image.new("RGBA", (width, box_h), (0,0,0,0))
-    # rounded rect
-    rect = Image.new("RGBA", (box_w, box_h), bg)
-    img.alpha_composite(rect, ((width - box_w)//2, 0))
-    # text
-    d = ImageDraw.Draw(img)
-    y = pad
+def draw_text_box(text:str,width:int,fontsize:int,bold=False,fg=(255,255,255),bg=(0,0,0,150)):
+    f=font(fontsize,bold)
+    d=ImageDraw.Draw(Image.new("RGB",(10,10)))
+    words=text.split(); lines=[]; cur=""
+    for w in words:
+        t=(cur+" "+w).strip(); wpx,_=d.textsize(t,font=f)
+        if wpx>width-40:
+            if cur: lines.append(cur); cur=w
+            else: lines.append(w); cur=""
+        else: cur=t
+    if cur: lines.append(cur)
+    ascent,descent=f.getmetrics(); lh=ascent+descent+6
+    box_w=min(width,max(d.textsize(x,font=f)[0] for x in lines)+36); box_h=lh*len(lines)+28
+    img=Image.new("RGBA",(width,box_h),(0,0,0,0))
+    rect=Image.new("RGBA",(box_w,box_h),bg)
+    img.alpha_composite(rect,((width-box_w)//2,0))
+    y=14; draw=ImageDraw.Draw(img)
     for ln in lines:
-        w,_ = d.textsize(ln, font=font)
-        x = (width - w)//2
-        d.text((x, y), ln, font=font, fill=fg)
-        y += lh
+        wpx,_=draw.textsize(ln,font=f); x=(width-wpx)//2
+        draw.text((x,y),ln,font=f,fill=fg); y+=lh
     return img
 
-def save_text_box(text: str, out_path: str, width: int, fontsize: int, bold=False):
-    # satır kır
-    font = get_font(size=fontsize, bold=bold)
-    d = ImageDraw.Draw(Image.new("RGB",(10,10)))
-    words = text.split()
-    lines, cur = [], ""
-    for w in words:
-        test = (cur + " " + w).strip()
-        wpx,_ = d.textsize(test, font=font)
-        if wpx > width - 40:
-            if cur: lines.append(cur)
-            cur = w
-        else:
-            cur = test
-    if cur: lines.append(cur)
-    img = draw_text_with_bg(width, lines, fontsize, bold)
-    img.save(out_path, "PNG")
+def save_text_box(text,out_path,width,fontsize,bold=False):
+    img=draw_text_box(text,width,fontsize,bold)
+    img.save(out_path,"PNG")
 
-# ---------- TTS (Edge + SSML + WordBoundary; fallback gTTS) ----------
+# ---------- TTS + timings ----------
 SSML_TMPL = """<speak version="1.0" xml:lang="en-US">
   <voice name="{voice}">
-    <mstts:express-as style="narration-professional">
-      <prosody rate="+4%" pitch="-2%">
-        {payload}
-      </prosody>
+    <mstts:express-as style="narration-relaxed">
+      <prosody rate="-3%" pitch="-2%">{payload}</prosody>
     </mstts:express-as>
   </voice>
 </speak>"""
 
-def sentences_to_ssml(sentences: List[str]) -> str:
-    # Her cümle arası 200ms
-    parts = []
-    for i, s in enumerate(sentences):
-        s = s.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
-        parts.append(f"<p>{s}</p>")
-        if i != len(sentences)-1:
-            parts.append('<break time="200ms"/>')
+def sentences_to_ssml(sents:List[str])->str:
+    parts=[]
+    for i,s in enumerate(sents):
+        s=(s.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;"))
+        # beat aralarına bilinçli duraklar
+        br="300ms" if i in (0,1) else "180ms"
+        parts.append(f"<p>{s}</p><break time=\"{br}\"/>")
     return "".join(parts)
 
-async def edge_tts_synthesize_ssml_async(sentences: List[str], outpath: str, voice: str) -> List[Tuple[str,float,float]]:
+async def edge_ssml_async(sentences:List[str], outpath:str, voice:str):
     import edge_tts, aiofiles
-    ssml = SSML_TMPL.format(voice=voice, payload=sentences_to_ssml(sentences))
-    communicator = edge_tts.Communicate(ssml, voice=voice)
-    timings: List[Tuple[str,float,float]] = []
-    async with aiofiles.open(outpath, "wb") as f:
-        async for chunk in communicator.stream():
-            if chunk["type"] == "audio":
-                await f.write(chunk["data"])
-            elif chunk["type"] in ("WordBoundary","Boundary"):
-                off = chunk.get("offset") or chunk.get("audio_offset") or 0
-                dur = chunk.get("duration", 0)
-                txt = (chunk.get("text") or "").strip()
-                try:
-                    s = off / 10_000_000.0
-                    d = (dur or 0) / 10_000_000.0
-                except Exception:
-                    s, d = 0.0, 0.0
-                if txt:
-                    timings.append((txt, s, s + max(d, 0.06)))
+    ssml=SSML_TMPL.format(voice=voice, payload=sentences_to_ssml(sentences))
+    comm=edge_tts.Communicate(ssml, voice=voice)
+    timings=[]
+    async with aiofiles.open(outpath,"wb") as f:
+        async for ch in comm.stream():
+            if ch["type"]=="audio":
+                await f.write(ch["data"])
+            elif ch["type"] in ("WordBoundary","Boundary"):
+                off=ch.get("offset") or ch.get("audio_offset") or 0
+                dur=ch.get("duration",0)
+                txt=(ch.get("text") or "").strip()
+                s=off/10_000_000.0
+                e=s+max((dur or 0)/10_000_000.0,0.06)
+                if txt: timings.append((txt,s,e))
     # normalize
-    out = []
-    for w, s, e in timings:
-        if e <= s: e = s + 0.08
-        out.append((w, s, e))
+    out=[]
+    for w,s,e in timings:
+        if e<=s: e=s+0.08
+        out.append((w,s,e))
     return out
 
-def tts_with_timings(sentences: List[str], narration_text: str, outpath: str, lang: str, voice: Optional[str]) -> List[Tuple[str,float,float]]:
-    # Edge-SSML dene
-    if voice:
-        try:
-            try:
-                asyncio.get_event_loop()
-            except RuntimeError:
-                asyncio.set_event_loop(asyncio.new_event_loop())
-            timings = asyncio.get_event_loop().run_until_complete(edge_tts_synthesize_ssml_async(sentences, outpath, voice))
-            if timings:
-                return timings
-        except Exception:
-            pass
-    # Fallback: gTTS (timings yok)
-    gTTS(text=narration_text, lang=lang, tld="com").save(outpath)
+def tts_with_timings(sentences:List[str], narration:str, outpath:str, lang:str, voice:str):
+    try:
+        try: asyncio.get_event_loop()
+        except RuntimeError: asyncio.set_event_loop(asyncio.new_event_loop())
+        t=asyncio.get_event_loop().run_until_complete(edge_ssml_async(sentences,outpath,voice))
+        if t: return t
+    except Exception:
+        pass
+    gTTS(text=narration,lang=lang,tld="com").save(outpath)
     return []
 
-# ---------- Ambient (procedural) ----------
-def generate_ambient_wav(path: str, duration_s: float, sr: int = 44100):
-    t = np.linspace(0, duration_s, int(sr*duration_s), endpoint=False)
-    freqs = [110.0, 220.0, 275.0]
-    phase = [0.0, 1.1, 2.0]
-    wave = sum(np.sin(2*np.pi*f*t + p) for f, p in zip(freqs, phase)) / 3.0
-    trem = 0.5*(1 + np.sin(2*np.pi*0.2*t))
-    audio = (wave * trem * 0.08).astype(np.float32)
-    # fade
-    fade = int(sr*0.8)
-    env = np.ones_like(audio)
-    env[:fade] = np.linspace(0,1,fade)
-    env[-fade:] = np.linspace(1,0,fade)
-    audio *= env
-    import soundfile as sf
-    sf.write(path, audio, sr)
+# ---------- Mastering (pydub) ----------
+def master_voice(in_mp3:str, out_mp3:str):
+    from pydub import AudioSegment, effects
+    voice=AudioSegment.from_file(in_mp3)
+    # de-ess benzeri: 5–9 kHz yumuşat (basit LPF + mix)
+    soft=voice.low_pass_filter(9000)
+    voice=soft
+    # HPF 120 Hz, LPF 8 kHz
+    voice=voice.high_pass_filter(120).low_pass_filter(8000)
+    # hafif kompresyon
+    voice=effects.compress_dynamic_range(voice, threshold=-18.0, ratio=2.0, attack=5, release=50)
+    # normalize -14 LUFS civarı
+    voice=effects.normalize(voice, headroom=14.0)
+    voice.export(out_mp3, format="mp3")
 
-def ensure_ambient(duration_s: float) -> Optional[str]:
-    custom = ASSETS_DIR / "ambience.mp3"
-    if custom.exists():
-        return str(custom)
-    try:
-        out = "ambient_autoyuson.wav"
-        generate_ambient_wav(out, duration_s)
-        return out
-    except Exception:
-        return None
+def duck_ambience(narration_path:str, ambience_path:str, out_path:str, up_gain_db=-13.0, down_gain_db=-18.0):
+    from pydub import AudioSegment
+    nar=AudioSegment.from_file(narration_path)
+    amb=AudioSegment.from_file(ambience_path)
+    if len(amb)<len(nar): amb=amb*int(math.ceil(len(nar)/len(amb)))
+    amb=amb[:len(nar)]
+    # basit duck: konuşma boyunca düşük, boşluklarda biraz daha yüksek
+    # sessizlik eşik: -42 dBFS altında
+    window=50  # ms
+    mixed=[]
+    for i in range(0, len(nar), window):
+        slice_db = nar[i:i+window].dBFS if nar[i:i+window].rms>0 else -90
+        gain = down_gain_db if slice_db>-42 else up_gain_db
+        mixed.append(amb[i:i+window]+gain)
+    res = sum(mixed[0:1]) if mixed else amb+down_gain_db
+    for seg in mixed[1:]:
+        res = res.append(seg, crossfade=5)
+    res.export(out_path, format="mp3")
 
-# ---------- Video yardımcıları ----------
-@dataclass
-class RenderResult:
-    video_path: str
-    title: str
-    description: str
-    tags: List[str]
-
+# ---------- Visual helpers ----------
 def fit_center_crop(img: Image.Image, w=W, h=H) -> Image.Image:
-    ratio_bg = img.width / img.height
-    ratio_frame = w / h
-    if ratio_bg > ratio_frame:
-        new_h = h; new_w = int(ratio_bg * new_h)
-    else:
-        new_w = w; new_h = int(new_w / ratio_bg)
-    img = img.resize((new_w, new_h), Image.LANCZOS)
-    left = (img.width - w)//2; top = (img.height - h)//2
-    return img.crop((left, top, left+w, top+h))
+    r=img.width/img.height; rf=w/h
+    if r>rf: new_h=h; new_w=int(r*new_h)
+    else: new_w=w; new_h=int(new_w/r)
+    img=img.resize((new_w,new_h),Image.LANCZOS)
+    L=(img.width-w)//2; T=(img.height-h)//2
+    return img.crop((L,T,L+w,T+h))
 
-def ken_burns_clip(img: Image.Image, duration: float, zoom_start=1.05, zoom_end=1.12):
-    path = "kb_tmp.jpg"; fit_center_crop(img).save(path, quality=92)
-    base = ImageClip(path).set_duration(duration)
-    def scaler(t):
-        return zoom_start + (zoom_end - zoom_start) * (t / max(duration, 0.001))
-    return base.resize(lambda t: scaler(t)).set_position(("center","center"))
+def apply_grade(img:Image.Image)->Image.Image:
+    # hafif sıcak ton + vignette + grain
+    graded = ImageOps.colorize(ImageOps.grayscale(img), black="#0b0b0b", white="#f2e8da").convert("RGB")
+    graded = Image.blend(img, graded, 0.18)
+    # vignette
+    vign = Image.new("L",(W,H),0)
+    vx=ImageDraw.Draw(vign)
+    for r in range(0, int(max(W,H)*0.75), 8):
+        alpha=int(255*min(1, (r/(max(W,H)*0.75))**2))
+        vx.ellipse((W//2-r, H//2-r, W//2+r, H//2+r), outline=alpha, width=8)
+    vign= vign.filter(ImageFilter.GaussianBlur(60))
+    graded.putalpha(255)
+    graded = Image.composite(graded, Image.new("RGBA",(W,H),(0,0,0,255)), vign.point(lambda p:255-p))
+    graded = graded.convert("RGB")
+    # grain
+    noise = (np.random.randn(H,W)*6+0).clip(-12,12).astype(np.int16)
+    arr = np.array(graded).astype(np.int16)
+    arr = np.clip(arr + noise[:,:,None], 0, 255).astype(np.uint8)
+    return Image.fromarray(arr)
 
-def build_broll(bg_images: List[Image.Image], duration: float):
-    if not bg_images:
-        bg_images = [Image.new("RGB",(W,H),(20,20,24))]
-    n = max(1, len(bg_images))
-    if n == 1:
-        return ken_burns_clip(bg_images[0], duration)
-    per = max(3.5, min(8.0, duration / n))
-    fc = 0.6
-    layers, t = [], 0.0
-    for im in bg_images:
-        clip = ken_burns_clip(im, per)
-        layers.append(clip.set_start(t).crossfadein(fc).crossfadeout(fc))
-        t += per - fc
+def ken_burns_clip(img: Image.Image, duration: float, z0=1.05, z1=1.12):
+    base = fit_center_crop(apply_grade(img))
+    path="kb.jpg"; base.save(path,quality=92)
+    clip=ImageClip(path).set_duration(duration)
+    return clip.resize(lambda t: z0+(z1-z0)*(t/duration)).set_position(("center","center"))
+
+def build_broll(images:List[Image.Image], duration:float):
+    if not images:
+        images=[Image.new("RGB",(W,H),(20,20,24))]
+    if len(images)==1:
+        return ken_burns_clip(images[0], duration)
+    per=max(3.6, min(7.8, duration/len(images))); fc=0.6
+    layers=[]; t=0.0
+    for im in images:
+        layers.append(ken_burns_clip(im, per).set_start(t).crossfadein(fc).crossfadeout(fc))
+        t+= per - fc
     return CompositeVideoClip(layers).set_duration(duration)
 
-# ---------- Sub timing ----------
-def split_words(text: str) -> List[str]:
-    return [w for w in re.findall(r"\S+", text)]
-
-def chunk_words(words: List[str], max_per=3) -> List[List[str]]:
-    out, buf = [], []
-    for w in words:
-        buf.append(w)
-        if len(buf) >= max_per:
-            out.append(buf); buf=[]
-    if buf: out.append(buf)
-    return out
-
-def words_to_chunks_with_timings(words: List[str], duration: float) -> List[Tuple[str,float,float]]:
-    n = max(1, len(words))
-    avg = max(0.18, min(0.26, duration / (n + 6)))
-    t = 0.7
-    out = []
-    for w in words:
-        start = t; end = min(duration-0.2, t + avg)
-        out.append((w, start, end))
-        t = end - 0.02
-        if t >= duration-0.2: break
-    return out
-
-def group_from_boundaries(boundaries: List[Tuple[str,float,float]], duration: float) -> List[Tuple[str,float,float]]:
-    if not boundaries:
-        return []
-    chunks, buf = [], []
-    for w, s, e in boundaries:
-        if not buf:
-            buf = [(w,s,e)]
+# ---------- Subtitles ----------
+def group_boundaries(bound:List[Tuple[str,float,float]], dur:float)->List[Tuple[str,float,float]]:
+    if not bound: return []
+    chunks=[]; buf=[]
+    for w,s,e in bound:
+        if not buf: buf=[(w,s,e)]
+        elif len(buf)<3 and (e-buf[0][1])<1.1:
+            buf.append((w,s,e))
         else:
-            if len(buf) < 3 and (e - buf[0][1]) < 1.1:
-                buf.append((w,s,e))
-            else:
-                text = " ".join(x[0] for x in buf)
-                chunks.append((text, buf[0][1], buf[-1][2]))
-                buf = [(w,s,e)]
+            txt=" ".join(x[0] for x in buf); chunks.append((txt, buf[0][1], buf[-1][2])); buf=[(w,s,e)]
+    if buf: chunks.append((" ".join(x[0] for x in buf), buf[0][1], buf[-1][2]))
+    # sınırla
+    out=[]
+    for t,s,e in chunks:
+        s=max(0.55,min(s,dur-0.3)); e=max(s+0.12,min(e,dur-0.2)); out.append((t,s,e))
+    return out
+
+def fallback_chunks(text:str, dur:float)->List[Tuple[str,float,float]]:
+    words=re.findall(r"\S+", text); n=max(1,len(words))
+    avg=max(0.18, min(0.24, dur/(n+6))); t=0.6; out=[]
+    buf=[]; cnt=0
+    for w in words:
+        buf.append(w); cnt+=1
+        if cnt==3:
+            out.append((" ".join(buf), t, min(dur-0.2, t+avg*3)))
+            t = t + avg*2.8; buf=[]; cnt=0
     if buf:
-        text = " ".join(x[0] for x in buf)
-        chunks.append((text, buf[0][1], buf[-1][2]))
-    norm = []
-    for text, s, e in chunks:
-        s = max(0.6, min(s, duration-0.3))
-        e = max(s+0.12, min(e, duration-0.2))
-        norm.append((text, s, e))
-    return norm
+        out.append((" ".join(buf), t, min(dur-0.2, t+avg*len(buf))))
+    return out
 
 # ---------- Render ----------
-def render_video(title: str, narration: str, sentences: List[str], audio_path: str,
-                 word_boundaries: List[Tuple[str,float,float]],
-                 bg_images: List[Image.Image], duration_hint: int, wiki_title_url: str) -> RenderResult:
+@dataclass
+class RenderResult:
+    video_path:str; title:str; description:str; tags:List[str]
+
+def render(title:str, narration:str, sentences:List[str],
+           audio_path:str, boundaries:List[Tuple[str,float,float]],
+           images:List[Image.Image], duration_hint:int, wiki_title_url:str)->RenderResult:
     ensure_fonts()
+    voice = AudioFileClip(audio_path)
+    duration = max(min(max(duration_hint,48),75), voice.duration+0.6)
 
-    narration_audio = AudioFileClip(audio_path)
-    duration = max(min(max(duration_hint, 48), 75), narration_audio.duration + 0.6)
-
-    broll = build_broll(bg_images, duration)
+    # Görsel
+    broll=build_broll(images, duration)
 
     # Başlık
-    title_png = "title.png"
-    save_text_box(title[:64], title_png, width=W-140, fontsize=60, bold=True)
-    title_clip = ImageClip(title_png).set_duration(min(5.0, duration*0.22)).set_position(("center", 72)).fadein(0.3).fadeout(0.3)
+    title_png="title.png"; save_text_box(title[:64], title_png, width=W-140, fontsize=58, bold=True)
+    title_clip=ImageClip(title_png).set_duration(min(5.0,duration*0.22)).set_position(("center",72)).fadein(0.3).fadeout(0.3)
 
-    # Altyazılar
-    subs = []
-    if word_boundaries:
-        chunks = group_from_boundaries(word_boundaries, narration_audio.duration)
-    else:
-        words = split_words(narration)
-        chunks_raw = chunk_words(words, max_per=3)
-        est = words_to_chunks_with_timings([w for g in chunks_raw for w in g], narration_audio.duration)
-        i = 0; chunks = []
-        for grp in chunks_raw:
-            if i >= len(est): break
-            s = est[i][1]; e = est[min(i+len(grp)-1, len(est)-1)][2]
-            chunks.append((" ".join(grp), s, e))
-            i += len(grp)
+    # Altyazı
+    subs=[]
+    chunks = group_boundaries(boundaries, voice.duration) if boundaries else fallback_chunks(narration, voice.duration)
+    for i,(txt,s,e) in enumerate(chunks):
+        fn=f"sub_{i:03d}.png"; save_text_box(txt, fn, width=W-220, fontsize=36, bold=False)
+        subs.append(ImageClip(fn).set_start(s).set_duration(e-s).set_position(("center",H-340)).fadein(0.07).fadeout(0.07))
 
-    for idx, (text, s, e) in enumerate(chunks):
-        fn = f"sub_{idx:03d}.png"
-        save_text_box(text, fn, width=W-200, fontsize=38, bold=False)  # küçük + arka planlı
-        clip = ImageClip(fn).set_start(s).set_duration(max(0.12, e - s)).set_position(("center", H-340)).fadein(0.07).fadeout(0.07)
-        subs.append(clip)
+    # Ambiyans + ducking
+    amb_custom = ASSETS_DIR/"ambience.mp3"
+    amb_path = str(amb_custom) if amb_custom.exists() else None
+    # Mastered narration
+    mastered="voice_mastered.mp3"; 
+    try:
+        master_voice(audio_path, mastered)
+        nar_clip = AudioFileClip(mastered)
+    except Exception:
+        nar_clip = voice
 
-    # Ambiyans
-    amb_path = ensure_ambient(duration)
-    audio_layers = [narration_audio.set_start(0).fx(afx.audio_normalize)]
+    audio_layers=[nar_clip.set_start(0)]
     if amb_path:
-        amb = AudioFileClip(amb_path).volumex(0.14).audio_fadein(0.7).audio_fadeout(0.8).set_duration(duration)
-        audio_layers.append(amb)
+        ducked="amb_ducked.mp3"
+        try:
+            duck_ambience(mastered if pathlib.Path(mastered).exists() else audio_path, amb_path, ducked)
+            amb_clip = AudioFileClip(ducked)
+        except Exception:
+            amb_clip = AudioFileClip(amb_path).volumex(0.14)
+        audio_layers.append(amb_clip.set_duration(duration))
+    else:
+        # procedural ambience yoksa sessiz devam
+        pass
 
-    comp_audio = CompositeAudioClip(audio_layers)
+    comp_audio=CompositeAudioClip([a.fx(afx.audio_normalize) for a in audio_layers])
+
     comp = CompositeVideoClip([broll, title_clip, *subs]).set_audio(comp_audio).set_duration(duration)
 
-    out_name = re.sub(r"[^-\w\s.,()]+","",title).strip().replace(" ","_")[:80] or "autoyuson_video"
-    out_path = f"{out_name}.mp4"
+    out = re.sub(r"[^-\w\s.,()]+","",title).strip().replace(" ","_")[:80] or "autoyuson_video"
+    out_path=f"{out}.mp4"
     comp.write_videofile(out_path, fps=30, codec="libx264", audio_codec="aac",
                          temp_audiofile="temp-audio.m4a", remove_temp=True, threads=4, verbose=False, logger=None)
 
-    wiki_url = f"{WIKI}/wiki/{urllib.parse.quote(wiki_title_url)}"
-    description = (f"{title}\n\nShort factual video. No speculation, no fiction.\n\n"
-                   f"Source:\n- Wikipedia: {wiki_url}"
-                   "\n\n#history #space #culture #facts #shorts")
-    return RenderResult(video_path=out_path, title=title, description=description, tags=DEFAULT_TAGS)
+    wiki_url=f"{WIKI}/wiki/{urllib.parse.quote(wiki_title_url)}"
+    desc=(f"{title}\n\nShort factual video. No speculation, no fiction.\n\n"
+          f"Source:\n- Wikipedia: {wiki_url}\n\n#history #space #culture #facts #shorts")
+    return RenderResult(out_path, title, desc, DEFAULT_TAGS)
 
 # ---------- OAuth / Upload ----------
-def _read_oauth_from_env_or_b64():
-    cid = os.getenv("YT_CLIENT_ID", "").strip()
-    csecret = os.getenv("YT_CLIENT_SECRET", "").strip()
-    rtoken = os.getenv("YT_REFRESH_TOKEN", "").strip()
-    if cid and csecret and rtoken:
-        return cid, csecret, rtoken
-    b64 = os.getenv("TOKEN_JSON_BASE64", "").strip()
-    if not b64:
-        return cid, csecret, rtoken
+def _read_oauth():
+    cid=os.getenv("YT_CLIENT_ID","").strip()
+    cs=os.getenv("YT_CLIENT_SECRET","").strip()
+    rt=os.getenv("YT_REFRESH_TOKEN","").strip()
+    if cid and cs and rt: return cid,cs,rt
+    b64=os.getenv("TOKEN_JSON_BASE64","").strip()
+    if not b64: return cid,cs,rt
     try:
-        raw = base64.b64decode(b64).decode("utf-8")
-        data = json.loads(raw)
-        rtoken2 = (data.get("refresh_token") or "").strip()
-        cid2 = (data.get("client_id") or cid).strip()
-        csecret2 = (data.get("client_secret") or csecret).strip()
-        return cid2 or cid, csecret2 or csecret, rtoken2 or rtoken
+        data=json.loads(base64.b64decode(b64).decode("utf-8"))
+        return (data.get("client_id") or cid or "",
+                data.get("client_secret") or cs or "",
+                data.get("refresh_token") or rt or "")
     except Exception:
-        return cid, csecret, rtoken
+        return cid,cs,rt
 
-def build_youtube_service():
-    client_id, client_secret, refresh_token = _read_oauth_from_env_or_b64()
-    if not refresh_token:
-        raise RuntimeError("Missing refresh_token. Set YT_REFRESH_TOKEN or TOKEN_JSON_BASE64.")
-    if not client_id or not client_secret:
-        cid_env = os.getenv("YT_CLIENT_ID", "").strip()
-        cs_env  = os.getenv("YT_CLIENT_SECRET", "").strip()
-        client_id = client_id or cid_env
-        client_secret = client_secret or cs_env
-        if not client_id or not client_secret:
-            raise RuntimeError("Missing client_id/client_secret.")
-    creds = Credentials(token=None, refresh_token=refresh_token,
-                        token_uri="https://oauth2.googleapis.com/token",
-                        client_id=client_id, client_secret=client_secret,
-                        scopes=["https://www.googleapis.com/auth/youtube.upload","https://www.googleapis.com/auth/youtube"])
+def build_youtube():
+    cid,cs,rt=_read_oauth()
+    if not (cid and cs and rt): raise RuntimeError("YouTube OAuth secrets missing.")
+    creds=Credentials(token=None, refresh_token=rt, token_uri="https://oauth2.googleapis.com/token",
+                      client_id=cid, client_secret=cs,
+                      scopes=["https://www.googleapis.com/auth/youtube.upload","https://www.googleapis.com/auth/youtube"])
     creds.refresh(Request())
     return build("youtube","v3",credentials=creds)
 
-def youtube_upload(video_path: str, title: str, description: str, tags: List[str],
-                   category_id: str = YOUTUBE_CATEGORY_ID, privacy_status: str = "public") -> str:
+def upload_youtube(path:str,title:str,desc:str,tags:List[str],cat="27",privacy="public")->str:
     from googleapiclient.http import MediaFileUpload
-    youtube = build_youtube_service()
-    body = {"snippet":{"title": title if not TITLE_PREFIX else f"{TITLE_PREFIX}{title}",
-                       "description": description, "categoryId": category_id, "tags": tags},
-            "status":{"privacyStatus": privacy_status, "selfDeclaredMadeForKids": False}}
-    media = MediaFileUpload(video_path, chunksize=-1, resumable=True, mimetype="video/*")
-    req = youtube.videos().insert(part="snippet,status", body=body, media_body=media)
-    resp = None
+    yt=build_youtube()
+    body={"snippet":{"title": title if not TITLE_PREFIX else f"{TITLE_PREFIX}{title}",
+                     "description":desc,"categoryId":cat,"tags":tags},
+          "status":{"privacyStatus":privacy,"selfDeclaredMadeForKids":False}}
+    media=MediaFileUpload(path, chunksize=-1, resumable=True, mimetype="video/*")
+    req=yt.videos().insert(part="snippet,status", body=body, media_body=media)
+    resp=None
     while resp is None:
         status, resp = req.next_chunk()
     return resp.get("id","")
 
 # ---------- Orchestrator ----------
-def main() -> int:
-    # Topic seç
-    seen = load_seen()
-    topic = pick_topic(seen)
+def main()->int:
+    seen=load_seen()
+    topic=pick_topic(seen)
     print(f"[AUTOYUSON] Topic: {topic}")
 
-    # Wiki verisi
-    title, summary, page_url, image_urls = wiki_fetch(topic)
-
-    # Metin
+    title, summary, page_url, img_urls = wiki_fetch(topic)
     narration, short_title, sentences = craft_script(title, summary)
-    if not is_factual_enough(narration):
-        pass
+    if not is_factual(narration): pass
 
     # Görseller
-    bg_images: List[Image.Image] = []
-    for u in image_urls:
-        im = download_image(u)
-        if im: bg_images.append(im)
-    if not bg_images:
-        bg_images = [Image.new("RGB",(W,H),(20,20,24))]
-    while len(bg_images) < 3:
-        bg_images.append(bg_images[-1])
+    imgs=[]
+    for u in img_urls:
+        im=download_image(u)
+        if im: imgs.append(im)
+    if not imgs: imgs=[Image.new("RGB",(W,H),(20,20,24))]
+    while len(imgs)<3: imgs.append(imgs[-1])
 
     # TTS + timings
-    audio_path = "narration_autoyuson.mp3"
-    word_boundaries = tts_with_timings(sentences, narration, audio_path, LANG, EDGE_TTS_VOICE)
+    voice_path="voice.mp3"
+    boundaries = tts_with_timings(sentences, narration, voice_path, LANG, EDGE_TTS_VOICE)
 
     # Render
-    result = render_video(short_title, narration, sentences, audio_path,
-                          word_boundaries, bg_images, DURATION_TARGET,
-                          wiki_title_url=title.replace(" ","_"))
+    result=render(short_title, narration, sentences, voice_path, boundaries, imgs, DURATION_TARGET, wiki_title_url=title.replace(" ","_"))
 
     # Upload
-    print("[AUTOYUSON] Uploading...")
-    vid = youtube_upload(result.video_path, result.title, result.description, result.tags)
+    print("[AUTOYUSON] Uploading…")
+    vid=upload_youtube(result.video_path, result.title, result.description, result.tags)
     print(f"[AUTOYUSON] Uploaded: https://youtube.com/watch?v={vid}")
 
     seen.append(title); save_seen(seen)
-    print("[AUTOYUSON] Seen topics updated.")
+    print("[AUTOYUSON] Done.")
     return 0
 
-if __name__ == "__main__":
+if __name__=="__main__":
     sys.exit(main())
