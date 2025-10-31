@@ -1,27 +1,28 @@
 """
 AUTOYUSON — Factual Shorts (History / Space / Culture) for Yusonvasya
 
-Güncellemeler:
-- Tek görselde bile tam süre Ken Burns (siyah ekran bitirildi)
-- Çoklu görsel: crossfade + hafif zoom (belgesel hissi)
-- Ambiyans müziği: procedural drone (veya assets/ambience.mp3 varsa onu kullanır)
-- Kelime senkron altyazı: Edge-TTS word boundary varsa birebir; yoksa 2–3 kelimelik hızlı chunk’lar
-- ImageMagick YOK; metin PNG’leri PIL ile
+İyileştirmeler:
+- Metin: Hook → Dense Facts → Closure (factual, ilgi çekici)
+- Ses: Edge-TTS + SSML (narration-professional, rate +4%, pitch -2%) → fallback gTTS
+- Altyazı: Edge WordBoundary ile mini-chunk senkron; yoksa akıcı tahmin
+- Altyazı okunabilirliği: yarı saydam arka plan şeridi
+- Görsel: Tek görselde tam süre Ken Burns; çok görselde crossfade
+- Ambiyans: assets/ambience.mp3 varsa kullan; yoksa procedural drone (çok düşük volüm)
 
 ENV (GitHub Secrets veya local):
   YT_CLIENT_ID, YT_CLIENT_SECRET, YT_REFRESH_TOKEN
   # Yedek:
-  TOKEN_JSON_BASE64   (token.json base64)
+  TOKEN_JSON_BASE64   (token.json base64; içinde refresh_token + client_id + client_secret)
 
 Opsiyonel:
   LANGUAGE=en
   VIDEO_DURATION=55
   TITLE_PREFIX=
   TOPICS_FILE=topics.txt
-  EDGE_TTS_VOICE=en-US-AriaNeural
+  EDGE_TTS_VOICE=en-US-JennyNeural  # daha doğal
 """
 
-import os, io, re, json, base64, random, textwrap, pathlib, sys, asyncio, urllib.parse, math
+import os, io, re, json, base64, random, textwrap, pathlib, sys, asyncio, urllib.parse
 from typing import List, Tuple, Optional
 from dataclasses import dataclass
 
@@ -53,7 +54,7 @@ TITLE_PREFIX = os.getenv("TITLE_PREFIX", "").strip()
 YOUTUBE_CATEGORY_ID = "27"
 DEFAULT_TAGS = ["history", "space", "astronomy", "archaeology", "culture", "documentary", "facts", "shorts"]
 TOPICS_FILE = os.getenv("TOPICS_FILE", "topics.txt")
-EDGE_TTS_VOICE = os.getenv("EDGE_TTS_VOICE", "en-US-AriaNeural")
+EDGE_TTS_VOICE = os.getenv("EDGE_TTS_VOICE", "en-US-JennyNeural")  # daha doğal hissiyat
 
 DATA_DIR = pathlib.Path("data"); DATA_DIR.mkdir(parents=True, exist_ok=True)
 SEEN_PATH = DATA_DIR / "seen_topics.json"
@@ -64,7 +65,7 @@ W, H = 1080, 1920
 WIKI = "https://en.wikipedia.org"
 REST = f"{WIKI}/api/rest_v1"
 API  = f"{WIKI}/w/api.php"
-UA = {"User-Agent": "autoyuson-bot/1.1 (+github)"}
+UA = {"User-Agent": "autoyuson-bot/1.2 (+github)"}
 
 CURATED_TOPICS = [
     "Rosetta Stone","Dead Sea Scrolls","Hagia Sophia","Voyager Golden Record","Terracotta Army","Göbekli Tepe",
@@ -148,7 +149,6 @@ def wiki_fetch(topic: str):
         thumb = s.get("thumbnail", {}).get("source")
         if thumb: imgs = [thumb] + imgs
         if extract:
-            # en az 3 görsel hedefleyelim (yoksa tek görseli tekrar kullanırız)
             return title, extract, page_url, imgs[:8]
     raise RuntimeError(f"Wiki fetch failed for topic: {topic}")
 
@@ -159,16 +159,23 @@ def download_image(url: str) -> Optional[Image.Image]:
     except Exception:
         return None
 
-# ---------- Script ----------
+# ---------- Script (hook → facts → close) ----------
 def craft_script(title: str, summary: str) -> Tuple[str, str, List[str]]:
+    # kanca için yıl/ölçü yakala
+    years = re.findall(r"(1[0-9]{3}|20[0-9]{2})", summary)
+    nums  = re.findall(r"\b([0-9]+(?:\.[0-9]+)?)(?:\s?(?:km|m|kg|years?|%|million|billion))?\b", summary, flags=re.I)
+    hook_bits = []
+    if years: hook_bits.append(years[0])
+    if nums:  hook_bits.append(nums[0])
+    hook = f"{title}: {', '.join(hook_bits)} — evidence that changed what we thought we knew." if hook_bits else f"{title}: evidence that changed what we thought we knew."
+
+    # temiz metin
     txt = re.sub(r"\s+", " ", summary).strip()
     words = txt.split()
-    if len(words) > 120: body = " ".join(words[:120])
-    elif len(words) < 80: body = txt + " " + " ".join((words+words)[:80])
-    else: body = txt
-    hook = f"{title}: a verified chapter of our shared past."
-    takeaway = "What endures is evidence — and what it reveals."
-    narration = f"{hook} {body} {takeaway}"
+    body = " ".join(words[:120]) if len(words) > 120 else (txt if len(words) >= 80 else (txt + " " + " ".join((words+words)[:80])))
+
+    close = "In history, what endures is what we can verify — and what it reveals."
+    narration = f"{hook} {body} {close}"
     sentences = [s.strip() for s in re.split(r'(?<=[.!?])\s+', narration) if s.strip()]
     return narration, title, sentences
 
@@ -200,115 +207,135 @@ def get_font(size=48, bold=False):
     except Exception:
         return ImageFont.load_default()
 
-def pil_text_image(text: str, width: int, fontsize: int, bold: bool=False, fill=(255,255,255), padding=8) -> Image.Image:
+def draw_text_with_bg(width: int, lines: List[str], fontsize: int, bold: bool=False,
+                      fg=(255,255,255), bg=(0,0,0,140), pad=14, radius=18) -> Image.Image:
     font = get_font(size=fontsize, bold=bold)
-    lines, cur = [], ""
     draw = ImageDraw.Draw(Image.new("RGB",(10,10)))
-    for word in text.split():
-        test = (cur + " " + word).strip()
-        w, _ = draw.textsize(test, font=font)
-        if w > width - 2*padding:
+    line_w = [draw.textsize(ln, font=font)[0] for ln in lines]
+    ascent, descent = font.getmetrics()
+    lh = ascent + descent + 6
+    box_w = min(width, max(line_w) + pad*2)
+    box_h = lh*len(lines) + pad*2
+    img = Image.new("RGBA", (width, box_h), (0,0,0,0))
+    # rounded rect
+    rect = Image.new("RGBA", (box_w, box_h), bg)
+    img.alpha_composite(rect, ((width - box_w)//2, 0))
+    # text
+    d = ImageDraw.Draw(img)
+    y = pad
+    for ln in lines:
+        w,_ = d.textsize(ln, font=font)
+        x = (width - w)//2
+        d.text((x, y), ln, font=font, fill=fg)
+        y += lh
+    return img
+
+def save_text_box(text: str, out_path: str, width: int, fontsize: int, bold=False):
+    # satır kır
+    font = get_font(size=fontsize, bold=bold)
+    d = ImageDraw.Draw(Image.new("RGB",(10,10)))
+    words = text.split()
+    lines, cur = [], ""
+    for w in words:
+        test = (cur + " " + w).strip()
+        wpx,_ = d.textsize(test, font=font)
+        if wpx > width - 40:
             if cur: lines.append(cur)
-            cur = word
+            cur = w
         else:
             cur = test
     if cur: lines.append(cur)
-    ascent, descent = font.getmetrics()
-    line_h = ascent + descent + 6
-    img_h = padding*2 + line_h*len(lines)
-    img = Image.new("RGBA", (width, img_h), (0,0,0,0))
-    draw = ImageDraw.Draw(img)
-    y = padding
-    for ln in lines:
-        w,_ = draw.textsize(ln, font=font)
-        x = (width - w)//2
-        draw.text((x+2, y+2), ln, font=font, fill=(0,0,0,160))
-        draw.text((x, y), ln, font=font, fill=fill)
-        y += line_h
-    return img
-
-def save_text_png(text: str, out_path: str, width: int, fontsize: int, bold=False, fill=(255,255,255)):
-    img = pil_text_image(text, width=width, fontsize=fontsize, bold=bold, fill=fill)
+    img = draw_text_with_bg(width, lines, fontsize, bold)
     img.save(out_path, "PNG")
 
-# ---------- TTS (Edge + word timings; fallback gTTS) ----------
-async def edge_tts_synthesize_async(text: str, outpath: str, voice: str) -> List[Tuple[str, float, float]]:
-    """
-    Return: [(word, start_s, end_s), ...]  (kelime sınırları)
-    """
+# ---------- TTS (Edge + SSML + WordBoundary; fallback gTTS) ----------
+SSML_TMPL = """<speak version="1.0" xml:lang="en-US">
+  <voice name="{voice}">
+    <mstts:express-as style="narration-professional">
+      <prosody rate="+4%" pitch="-2%">
+        {payload}
+      </prosody>
+    </mstts:express-as>
+  </voice>
+</speak>"""
+
+def sentences_to_ssml(sentences: List[str]) -> str:
+    # Her cümle arası 200ms
+    parts = []
+    for i, s in enumerate(sentences):
+        s = s.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
+        parts.append(f"<p>{s}</p>")
+        if i != len(sentences)-1:
+            parts.append('<break time="200ms"/>')
+    return "".join(parts)
+
+async def edge_tts_synthesize_ssml_async(sentences: List[str], outpath: str, voice: str) -> List[Tuple[str,float,float]]:
     import edge_tts, aiofiles
-    timings: List[Tuple[str, float, float]] = []
-    communicator = edge_tts.Communicate(text, voice=voice)  # boundary için stream'e bakacağız
-    cur_word_start = None
-    cur_word = None
+    ssml = SSML_TMPL.format(voice=voice, payload=sentences_to_ssml(sentences))
+    communicator = edge_tts.Communicate(ssml, voice=voice)
+    timings: List[Tuple[str,float,float]] = []
     async with aiofiles.open(outpath, "wb") as f:
         async for chunk in communicator.stream():
             if chunk["type"] == "audio":
                 await f.write(chunk["data"])
             elif chunk["type"] in ("WordBoundary","Boundary"):
-                # edge-tts bazen 'offset' ya da 'audio_offset' verir; 100-ns → saniye
-                off = chunk.get("offset") or chunk.get("audio_offset")
+                off = chunk.get("offset") or chunk.get("audio_offset") or 0
                 dur = chunk.get("duration", 0)
                 txt = (chunk.get("text") or "").strip()
                 try:
-                    start_s = (off or 0) / 10_000_000.0
-                    dur_s = (dur or 0) / 10_000_000.0
+                    s = off / 10_000_000.0
+                    d = (dur or 0) / 10_000_000.0
                 except Exception:
-                    start_s, dur_s = 0.0, 0.0
+                    s, d = 0.0, 0.0
                 if txt:
-                    timings.append((txt, start_s, start_s + max(dur_s, 0.06)))
-    # filtrele: çok kısa kelimeleri de kısacık gösterelim
+                    timings.append((txt, s, s + max(d, 0.06)))
+    # normalize
     out = []
     for w, s, e in timings:
         if e <= s: e = s + 0.08
         out.append((w, s, e))
     return out
 
-def tts_to_file_with_timings(text: str, outpath: str, lang: str = "en", voice: Optional[str] = None) -> List[Tuple[str,float,float]]:
-    # Edge-TTS dene
+def tts_with_timings(sentences: List[str], narration_text: str, outpath: str, lang: str, voice: Optional[str]) -> List[Tuple[str,float,float]]:
+    # Edge-SSML dene
     if voice:
         try:
             try:
                 asyncio.get_event_loop()
             except RuntimeError:
                 asyncio.set_event_loop(asyncio.new_event_loop())
-            timings = asyncio.get_event_loop().run_until_complete(edge_tts_synthesize_async(text, outpath, voice))
+            timings = asyncio.get_event_loop().run_until_complete(edge_tts_synthesize_ssml_async(sentences, outpath, voice))
             if timings:
                 return timings
         except Exception:
             pass
-    # Fallback gTTS (timings yok → boş liste)
-    gTTS(text=text, lang=lang, tld="com").save(outpath)
+    # Fallback: gTTS (timings yok)
+    gTTS(text=narration_text, lang=lang, tld="com").save(outpath)
     return []
 
 # ---------- Ambient (procedural) ----------
 def generate_ambient_wav(path: str, duration_s: float, sr: int = 44100):
     t = np.linspace(0, duration_s, int(sr*duration_s), endpoint=False)
-    # 3 düşük frekanslı drone + çok düşük genlik
     freqs = [110.0, 220.0, 275.0]
-    wave = sum(np.sin(2*np.pi*f*t + ph) for f, ph in zip(freqs, [0.0, 1.3, 2.1])) / 3.0
-    # hafif tremolo
+    phase = [0.0, 1.1, 2.0]
+    wave = sum(np.sin(2*np.pi*f*t + p) for f, p in zip(freqs, phase)) / 3.0
     trem = 0.5*(1 + np.sin(2*np.pi*0.2*t))
-    audio = (wave * trem * 0.08).astype(np.float32)  # düşük volüm
-    # fade in/out
-    fade_len = int(sr*1.0)
+    audio = (wave * trem * 0.08).astype(np.float32)
+    # fade
+    fade = int(sr*0.8)
     env = np.ones_like(audio)
-    env[:fade_len] = np.linspace(0, 1, fade_len)
-    env[-fade_len:] = np.linspace(1, 0, fade_len)
+    env[:fade] = np.linspace(0,1,fade)
+    env[-fade:] = np.linspace(1,0,fade)
     audio *= env
-    # yaz
     import soundfile as sf
     sf.write(path, audio, sr)
 
 def ensure_ambient(duration_s: float) -> Optional[str]:
-    # Eğer assets/ambience.mp3 varsa onu kullan
     custom = ASSETS_DIR / "ambience.mp3"
     if custom.exists():
         return str(custom)
-    # yoksa procedural üret (WAV)
     try:
         out = "ambient_autoyuson.wav"
-        # soundfile yoksa kurulu değilse MoviePy'nin AudioClip ile yazması zahmetli; bu yüzden requirements'a soundfile ekledik
         generate_ambient_wav(out, duration_s)
         return out
     except Exception:
@@ -333,16 +360,12 @@ def fit_center_crop(img: Image.Image, w=W, h=H) -> Image.Image:
     left = (img.width - w)//2; top = (img.height - h)//2
     return img.crop((left, top, left+w, top+h))
 
-def ken_burns_clip(img: Image.Image, duration: float, zoom_start=1.06, zoom_end=1.12, pan_dx=0, pan_dy=0):
-    """Tek görsel için garantili tam-süre Ken Burns."""
+def ken_burns_clip(img: Image.Image, duration: float, zoom_start=1.05, zoom_end=1.12):
     path = "kb_tmp.jpg"; fit_center_crop(img).save(path, quality=92)
     base = ImageClip(path).set_duration(duration)
-    # zamanla ölçek ve küçük pan
     def scaler(t):
-        k = zoom_start + (zoom_end - zoom_start) * (t / max(duration, 0.001))
-        return k
-    clip = base.resize(lambda t: scaler(t)).set_position(("center","center"))
-    return clip
+        return zoom_start + (zoom_end - zoom_start) * (t / max(duration, 0.001))
+    return base.resize(lambda t: scaler(t)).set_position(("center","center"))
 
 def build_broll(bg_images: List[Image.Image], duration: float):
     if not bg_images:
@@ -350,18 +373,14 @@ def build_broll(bg_images: List[Image.Image], duration: float):
     n = max(1, len(bg_images))
     if n == 1:
         return ken_burns_clip(bg_images[0], duration)
-    # birden çok görsel → hepsine kısmi zoom ve crossfade bindirme
-    per = duration / n
-    per = max(3.5, min(8.0, per))
-    fc = 0.6  # crossfade
-    layers = []
-    t = 0.0
-    for i, im in enumerate(bg_images):
-        clip = ken_burns_clip(im, per, zoom_start=1.05, zoom_end=1.12)
+    per = max(3.5, min(8.0, duration / n))
+    fc = 0.6
+    layers, t = [], 0.0
+    for im in bg_images:
+        clip = ken_burns_clip(im, per)
         layers.append(clip.set_start(t).crossfadein(fc).crossfadeout(fc))
         t += per - fc
-    comp = CompositeVideoClip(layers).set_duration(duration)
-    return comp
+    return CompositeVideoClip(layers).set_duration(duration)
 
 # ---------- Sub timing ----------
 def split_words(text: str) -> List[str]:
@@ -377,28 +396,25 @@ def chunk_words(words: List[str], max_per=3) -> List[List[str]]:
     return out
 
 def words_to_chunks_with_timings(words: List[str], duration: float) -> List[Tuple[str,float,float]]:
-    # Kelime başı ~0.18–0.28s gibi hızlı bir akış
     n = max(1, len(words))
-    avg = max(0.18, min(0.28, duration / (n+4)))
-    t = 0.8
+    avg = max(0.18, min(0.26, duration / (n + 6)))
+    t = 0.7
     out = []
     for w in words:
         start = t; end = min(duration-0.2, t + avg)
         out.append((w, start, end))
-        t = end - 0.02  # ufak bindirme
+        t = end - 0.02
         if t >= duration-0.2: break
     return out
 
-def group_or_from_boundaries(boundaries: List[Tuple[str,float,float]], duration: float) -> List[Tuple[str,float,float]]:
+def group_from_boundaries(boundaries: List[Tuple[str,float,float]], duration: float) -> List[Tuple[str,float,float]]:
     if not boundaries:
         return []
-    # doğrudan kelime altyazısı (çok hızlı olabilir). Okunurluk için 2'şer veya 3'er gruplar halinde topla.
-    chunks = []
-    buf: List[Tuple[str,float,float]] = []
+    chunks, buf = [], []
     for w, s, e in boundaries:
-        if not buf: buf.append((w,s,e))
+        if not buf:
+            buf = [(w,s,e)]
         else:
-            # grupla; toplam süre çok uzamasın
             if len(buf) < 3 and (e - buf[0][1]) < 1.1:
                 buf.append((w,s,e))
             else:
@@ -408,45 +424,38 @@ def group_or_from_boundaries(boundaries: List[Tuple[str,float,float]], duration:
     if buf:
         text = " ".join(x[0] for x in buf)
         chunks.append((text, buf[0][1], buf[-1][2]))
-    # sınırlar
     norm = []
     for text, s, e in chunks:
         s = max(0.6, min(s, duration-0.3))
-        e = max(s+0.1, min(e, duration-0.2))
+        e = max(s+0.12, min(e, duration-0.2))
         norm.append((text, s, e))
     return norm
 
 # ---------- Render ----------
-def render_video(title: str, narration: str, audio_path: str,
+def render_video(title: str, narration: str, sentences: List[str], audio_path: str,
                  word_boundaries: List[Tuple[str,float,float]],
-                 bg_images: List[Image.Image], duration_hint: int,
-                 wiki_title_url: str) -> RenderResult:
+                 bg_images: List[Image.Image], duration_hint: int, wiki_title_url: str) -> RenderResult:
     ensure_fonts()
 
     narration_audio = AudioFileClip(audio_path)
-    duration = max(min(max(duration_hint, 45), 75), narration_audio.duration + 0.6)
+    duration = max(min(max(duration_hint, 48), 75), narration_audio.duration + 0.6)
 
-    # B-roll
     broll = build_broll(bg_images, duration)
 
-    # Başlık (daha küçük, üstte)
+    # Başlık
     title_png = "title.png"
-    save_text_png(title[:64], title_png, width=W-140, fontsize=64, bold=True)
-    title_clip = ImageClip(title_png).set_duration(min(5.0, duration*0.2)).set_position(("center", 64)).fadein(0.3).fadeout(0.3)
+    save_text_box(title[:64], title_png, width=W-140, fontsize=60, bold=True)
+    title_clip = ImageClip(title_png).set_duration(min(5.0, duration*0.22)).set_position(("center", 72)).fadein(0.3).fadeout(0.3)
 
-    # Altyazılar (küçük, kelime/mini-chunk senkron)
+    # Altyazılar
     subs = []
     if word_boundaries:
-        chunks = group_or_from_boundaries(word_boundaries, narration_audio.duration)
+        chunks = group_from_boundaries(word_boundaries, narration_audio.duration)
     else:
         words = split_words(narration)
         chunks_raw = chunk_words(words, max_per=3)
-        # süreyi toplam kelimeye göre dağıt
-        chunks = []
-        word_seq = [w for grp in chunks_raw for w in grp]
-        est = words_to_chunks_with_timings(word_seq, narration_audio.duration)
-        # est ile chunk’ları eşleştir
-        i = 0
+        est = words_to_chunks_with_timings([w for g in chunks_raw for w in g], narration_audio.duration)
+        i = 0; chunks = []
         for grp in chunks_raw:
             if i >= len(est): break
             s = est[i][1]; e = est[min(i+len(grp)-1, len(est)-1)][2]
@@ -455,20 +464,18 @@ def render_video(title: str, narration: str, audio_path: str,
 
     for idx, (text, s, e) in enumerate(chunks):
         fn = f"sub_{idx:03d}.png"
-        save_text_png(text, fn, width=W-160, fontsize=42, bold=False)  # daha küçük
-        clip = ImageClip(fn).set_start(s).set_duration(max(0.12, e - s)).set_position(("center", H-360)).fadein(0.08).fadeout(0.08)
+        save_text_box(text, fn, width=W-200, fontsize=38, bold=False)  # küçük + arka planlı
+        clip = ImageClip(fn).set_start(s).set_duration(max(0.12, e - s)).set_position(("center", H-340)).fadein(0.07).fadeout(0.07)
         subs.append(clip)
 
     # Ambiyans
     amb_path = ensure_ambient(duration)
     audio_layers = [narration_audio.set_start(0).fx(afx.audio_normalize)]
     if amb_path:
-        amb = AudioFileClip(amb_path).volumex(0.18).audio_fadein(0.8).audio_fadeout(0.8)
-        amb = amb.set_duration(duration)
+        amb = AudioFileClip(amb_path).volumex(0.14).audio_fadein(0.7).audio_fadeout(0.8).set_duration(duration)
         audio_layers.append(amb)
 
     comp_audio = CompositeAudioClip(audio_layers)
-
     comp = CompositeVideoClip([broll, title_clip, *subs]).set_audio(comp_audio).set_duration(duration)
 
     out_name = re.sub(r"[^-\w\s.,()]+","",title).strip().replace(" ","_")[:80] or "autoyuson_video"
@@ -482,7 +489,7 @@ def render_video(title: str, narration: str, audio_path: str,
                    "\n\n#history #space #culture #facts #shorts")
     return RenderResult(video_path=out_path, title=title, description=description, tags=DEFAULT_TAGS)
 
-# ---------- OAuth helpers / YouTube ----------
+# ---------- OAuth / Upload ----------
 def _read_oauth_from_env_or_b64():
     cid = os.getenv("YT_CLIENT_ID", "").strip()
     csecret = os.getenv("YT_CLIENT_SECRET", "").strip()
@@ -536,16 +543,20 @@ def youtube_upload(video_path: str, title: str, description: str, tags: List[str
 
 # ---------- Orchestrator ----------
 def main() -> int:
+    # Topic seç
     seen = load_seen()
     topic = pick_topic(seen)
     print(f"[AUTOYUSON] Topic: {topic}")
 
+    # Wiki verisi
     title, summary, page_url, image_urls = wiki_fetch(topic)
+
+    # Metin
     narration, short_title, sentences = craft_script(title, summary)
     if not is_factual_enough(narration):
         pass
 
-    # Görselleri indir; en az 3’e tamamlamak için tekrar kullan
+    # Görseller
     bg_images: List[Image.Image] = []
     for u in image_urls:
         im = download_image(u)
@@ -555,12 +566,14 @@ def main() -> int:
     while len(bg_images) < 3:
         bg_images.append(bg_images[-1])
 
-    # TTS + word timings
+    # TTS + timings
     audio_path = "narration_autoyuson.mp3"
-    boundaries = tts_to_file_with_timings(narration, audio_path, LANG, voice=EDGE_TTS_VOICE)
+    word_boundaries = tts_with_timings(sentences, narration, audio_path, LANG, EDGE_TTS_VOICE)
 
     # Render
-    result = render_video(short_title, narration, audio_path, boundaries, bg_images, DURATION_TARGET, wiki_title_url=title.replace(" ","_"))
+    result = render_video(short_title, narration, sentences, audio_path,
+                          word_boundaries, bg_images, DURATION_TARGET,
+                          wiki_title_url=title.replace(" ","_"))
 
     # Upload
     print("[AUTOYUSON] Uploading...")
