@@ -1,4 +1,4 @@
-name: Autoyuson — Factual Shorts
+name: Autoyuson — Factual Shorts (Cinematic v3)
 
 on:
   workflow_dispatch:
@@ -33,11 +33,10 @@ jobs:
           python -m pip install --upgrade pip setuptools wheel
           python -m pip install --no-cache-dir numpy==1.26.4
           python -m pip install --no-cache-dir imageio==2.31.1 imageio-ffmpeg==0.4.8
-          python -m pip install --no-cache-dir moviepy==1.0.3
-          python -m pip install --no-cache-dir pillow==9.5.0
-          python -m pip install --no-cache-dir edge-tts aiofiles
-          python -m pip install --no-cache-dir gTTS requests google-api-python-client google-auth-httplib2 google-auth-oauthlib
-          python -m pip install --no-cache-dir soundfile
+          python -m pip install --no-cache-dir moviepy==1.0.3 pillow==9.5.0
+          python -m pip install --no-cache-dir requests edge-tts aiofiles gTTS
+          python -m pip install --no-cache-dir pydub soundfile
+          python -m pip install --no-cache-dir google-api-python-client google-auth-httplib2 google-auth-oauthlib
           python - << 'PY'
           import sys, moviepy, imageio, numpy
           import moviepy.editor as m
@@ -57,30 +56,20 @@ jobs:
         run: |
           python - << 'PY'
           import os, sys, base64, json
-          cid = os.getenv("YT_CLIENT_ID","").strip()
-          cs  = os.getenv("YT_CLIENT_SECRET","").strip()
-          rt  = os.getenv("YT_REFRESH_TOKEN","").strip()
-          b64 = os.getenv("TOKEN_JSON_BASE64","").strip()
-          ok = True
+          cid=os.getenv("YT_CLIENT_ID","").strip()
+          cs=os.getenv("YT_CLIENT_SECRET","").strip()
+          rt=os.getenv("YT_REFRESH_TOKEN","").strip()
+          b64=os.getenv("TOKEN_JSON_BASE64","").strip()
+          ok=True
           if not (cid and cs and rt):
-              if not b64:
-                  print("ERROR: Missing secrets. Provide either:")
-                  print("  - YT_CLIENT_ID, YT_CLIENT_SECRET, YT_REFRESH_TOKEN")
-                  print("    or")
-                  print("  - TOKEN_JSON_BASE64 (base64 of token.json)")
-                  ok = False
-              else:
-                  try:
-                      raw = base64.b64decode(b64).decode("utf-8")
-                      data = json.loads(raw)
-                      if not data.get("refresh_token"):
-                          print("ERROR: TOKEN_JSON_BASE64 present but no refresh_token in JSON.")
-                          ok = False
-                  except Exception:
-                      print("ERROR: TOKEN_JSON_BASE64 invalid.")
-                      ok = False
-          if not ok:
-              sys.exit(1)
+            if not b64:
+              print("ERROR: Missing secrets. Provide either three YT_* or TOKEN_JSON_BASE64."); ok=False
+            else:
+              try:
+                data=json.loads(base64.b64decode(b64).decode("utf-8"))
+                if not data.get("refresh_token"): print("ERROR: TOKEN_JSON_BASE64 has no refresh_token."); ok=False
+              except Exception: print("ERROR: TOKEN_JSON_BASE64 invalid."); ok=False
+          if not ok: sys.exit(1)
           print("Secrets preflight OK.")
           PY
 
