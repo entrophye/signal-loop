@@ -413,18 +413,24 @@ def run_pipeline():
 
     # 7) YouTube (tarih yok; her koşuda değişken)
     title = random.choice(DYNAMIC_TITLES)
+
+    lead_options = [
+        "Recovered long-range transmission.",
+        "Field log stitched from T-3012 archives.",
+        "A relay caught between static and prayer."
+    ]
+    lead = random.choice(lead_options)
+
     desc = (
-        f"{random.choice(['Recovered long-range transmission.',
-                          'Field log stitched from T-3012 archives.',
-                          'A relay caught between static and prayer.'])}\n\n"
+        lead + "\n\n"
         "God is not gone. He's buried.\n"
         "Automated longform transmission."
     )
+
     tags = ["godfinders","ai","cosmic horror","existential","longform","eclipsera","signal"]
 
     vid = upload_to_youtube(mp4, title, desc, tags)
     print("Uploaded video ID:", vid)
-
 
 if __name__ == "__main__":
     run_pipeline()
