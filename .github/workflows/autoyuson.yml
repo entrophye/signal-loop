@@ -3,7 +3,7 @@ name: Autoyuson — Factual Shorts
 on:
   workflow_dispatch:
   schedule:
-    - cron: "17 13 * * *"
+    - cron: "17 13 * * *"  # her gün 16:17 (+03)
 
 permissions:
   contents: write
@@ -22,26 +22,16 @@ jobs:
         with:
           python-version: "3.11"
 
-      # 🔧 Gerekli sistem paketleri (ffmpeg + fonts + ImageMagick)
-      - name: Install system deps
+      # Sadece ffmpeg; ImageMagick KALDIRILDI
+      - name: Install ffmpeg
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg imagemagick fonts-dejavu-core
-          # (Bazı runner'larda ImageMagick zaten var; yoksa bu kurar.)
+          sudo apt-get install -y ffmpeg
 
-      # 🧩 Python paketleri
       - name: Install Python deps
         run: |
           python -m pip install --upgrade pip
           pip install google-api-python-client google-auth-httplib2 google-auth-oauthlib moviepy gTTS pillow requests wikipedia
-
-      # ✅ Hızlı kontrol (MoviePy import ediliyor mu?)
-      - name: Sanity check imports
-        run: |
-          python - << 'PY'
-          import moviepy.editor as m, PIL, gtts, requests, wikipedia
-          print("Imports OK")
-          PY
 
       - name: Run Autoyuson
         env:
@@ -65,4 +55,3 @@ jobs:
             git push
           else
             echo "No changes to commit."
-          fi
