@@ -35,8 +35,11 @@ jobs:
           python -m pip install --no-cache-dir imageio==2.31.1 imageio-ffmpeg==0.4.8
           python -m pip install --no-cache-dir moviepy==1.0.3
           python -m pip install --no-cache-dir pillow==9.5.0
+          # Yeni: Edge-TTS ve async dosya yazımı
+          python -m pip install --no-cache-dir edge-tts aiofiles
           python -m pip install --no-cache-dir gTTS requests wikipedia \
             google-api-python-client google-auth-httplib2 google-auth-oauthlib
+          # Doğrulama
           python - << 'PY'
           import sys, moviepy, imageio, numpy
           import moviepy.editor as m
@@ -93,10 +96,10 @@ jobs:
           VIDEO_DURATION: "55"
           TITLE_PREFIX: ""
           CONTENT_THEME: "FACTUAL_SHORTS"
+          EDGE_TTS_VOICE: "en-US-AriaNeural"
         run: |
           python main_autoyuson.py
 
-      # ⬇️ Shell script yerine güvenilir auto-commit action
       - name: Commit seen topics (if changed)
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
