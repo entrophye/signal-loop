@@ -2,15 +2,16 @@
 """
 AUTOYUSON — Cinematic Factual Shorts (History / Space / Culture)
 
-V3 ana farklar:
+V3 (fixed) ana farklar:
 - Beat sheet metin: cold open → hook → 3 fact → close
 - Edge-TTS + SSML (narration-relaxed, rate -3%, pitch -2%), gTTS fallback
-- Pydub ile mastering: HPF 120 Hz, LPF 8 kHz, hafif kompresyon, de-ess benzeri yumuşatma
-- Ambiyans müziği + otomatik ducking (konuşma sırasında 0.12 vol, aralarda 0.20 vol)
-- Görsel sinema dokusu: Ken Burns, crossfade, vignette, warm grade, film-grain
+- Pydub mastering: HPF 120 Hz, LPF 8 kHz, hafif kompresyon, yumuşatma
+- Ambiyans + otomatik ducking
+- Görsel sinema dokusu: Ken Burns, crossfade, warm grade, vignette, film-grain
 - Mini-chunk kelime senkron altyazı
+- **BUGFIX:** Vinyet/overlay artık her görselin kendi boyutunda oluşturuluyor (ValueError bitti)
 
-Gerekli ENV:
+ENV (GitHub Secrets veya local):
   YT_CLIENT_ID, YT_CLIENT_SECRET, YT_REFRESH_TOKEN
   (veya TOKEN_JSON_BASE64 içinde refresh_token + client_id + client_secret)
 
@@ -22,7 +23,7 @@ Opsiyonel:
   EDGE_TTS_VOICE=en-US-JennyNeural
 """
 
-import os, io, re, json, base64, random, textwrap, pathlib, sys, asyncio, urllib.parse, math
+import os, io, re, json, base64, random, pathlib, sys, asyncio, urllib.parse, math
 from typing import List, Tuple, Optional
 from dataclasses import dataclass
 
@@ -31,7 +32,7 @@ from PIL import Image, ImageDraw, ImageFont, ImageFilter, ImageOps
 import numpy as np
 from gtts import gTTS
 from moviepy.editor import (ImageClip, AudioFileClip, CompositeVideoClip,
-                            CompositeAudioClip, afx, ColorClip)
+                            CompositeAudioClip, afx)
 from moviepy.video.fx.all import resize as mp_resize
 from googleapiclient.discovery import build
 from google.oauth2.credentials import Credentials
@@ -76,9 +77,8 @@ CURATED_TOPICS = [
 
 # ---------- Seen topics ----------
 def load_seen() -> List[str]:
-    p = SEEN_PATH
-    if p.exists():
-        try: return json.loads(p.read_text(encoding="utf-8"))
+    if SEEN_PATH.exists():
+        try: return json.loads(SEEN_PATH.read_text(encoding="utf-8"))
         except Exception: return []
     return []
 
@@ -102,14 +102,12 @@ def pick_topic(seen: List[str]) -> str:
 
 # ---------- Wikipedia (REST) ----------
 def _rest_summary(title: str):
-    import urllib.parse as up
-    url = f"{REST}/page/summary/{up.quote(title)}"
+    url = f"{REST}/page/summary/{urllib.parse.quote(title)}"
     r = requests.get(url, headers=UA, timeout=20)
     return r.json() if r.status_code == 200 else None
 
 def _rest_media(title: str):
-    import urllib.parse as up
-    url = f"{REST}/page/media/{up.quote(title)}"
+    url = f"{REST}/page/media/{urllib.parse.quote(title)}"
     r = requests.get(url, headers=UA, timeout=20)
     return r.json() if r.status_code == 200 else None
 
@@ -134,9 +132,9 @@ def wiki_fetch(topic: str):
         if m and "items" in m:
             for it in m["items"]:
                 if it.get("type")!="image": continue
-                src = (it.get("srcset") or [])
-                src = sorted(src, key=lambda x: x.get("scale",1.0))
-                url = (src[-1]["src"] if src else it.get("src")) or ""
+                srcset = it.get("srcset") or []
+                srcset = sorted(srcset, key=lambda x: x.get("scale",1.0))
+                url = (srcset[-1]["src"] if srcset else it.get("src")) or ""
                 low=url.lower()
                 if any(b in low for b in ["logo","icon","flag","seal","map","diagram","coat_of_arms","favicon","sprite"]): continue
                 if not low.endswith((".jpg",".jpeg",".png",".webp")): continue
@@ -157,14 +155,12 @@ def download_image(url: str) -> Optional[Image.Image]:
 # ---------- Script (Beat Sheet) ----------
 def craft_script(title: str, summary: str):
     clean = re.sub(r"\s+"," ", summary).strip()
-    years = re.findall(r"(1[0-9]{3}|20[0-9]{2})", clean)
-    numbers = re.findall(r"\b\d[\d,\.]*\b", clean)
-    # Beats
     cold_open = f"{title}. Verified, preserved, undeniable."
-    hook = f"What changed our understanding? Evidence — not legend."
-    fact1 = " ".join(clean.split()[:40])
-    fact2 = " ".join(clean.split()[40:80]) or clean
-    fact3 = " ".join(clean.split()[80:120]) or clean
+    hook       = "What changed our understanding? Evidence — not legend."
+    words = clean.split()
+    fact1 = " ".join(words[:40]) if words else clean
+    fact2 = " ".join(words[40:80]) or clean
+    fact3 = " ".join(words[80:120]) or clean
     close = "History survives by proof — and by those who keep looking."
     sentences = [cold_open, hook, fact1, fact2, fact3, close]
     narration = " ".join(sentences)
@@ -175,14 +171,13 @@ def is_factual(text:str)->bool:
     n=len(text.split()); return 80<=n<=260
 
 # ---------- Fonts & Text ----------
-FONTS = {
-    "reg": FONTS_DIR/"NotoSans-Regular.ttf",
-    "bold":FONTS_DIR/"NotoSans-Bold.ttf",
-}
+N_REG = FONTS_DIR/"NotoSans-Regular.ttf"
+N_BOLD= FONTS_DIR/"NotoSans-Bold.ttf"
+
 def ensure_fonts():
     urls={
-        FONTS["reg"]:"https://github.com/googlefonts/noto-fonts/raw/main/hinted/ttf/NotoSans/NotoSans-Regular.ttf",
-        FONTS["bold"]:"https://github.com/googlefonts/noto-fonts/raw/main/hinted/ttf/NotoSans/NotoSans-Bold.ttf",
+        N_REG :"https://github.com/googlefonts/noto-fonts/raw/main/hinted/ttf/NotoSans/NotoSans-Regular.ttf",
+        N_BOLD:"https://github.com/googlefonts/noto-fonts/raw/main/hinted/ttf/NotoSans/NotoSans-Bold.ttf",
     }
     for p,u in urls.items():
         if not p.exists():
@@ -191,12 +186,12 @@ def ensure_fonts():
                 p.write_bytes(r.content)
             except Exception: pass
 
-def font(size=48,bold=False):
-    try: return ImageFont.truetype(str(FONTS["bold" if bold else "reg"]), size=size)
+def get_font(size=48,bold=False):
+    try: return ImageFont.truetype(str(N_BOLD if bold else N_REG), size=size)
     except Exception: return ImageFont.load_default()
 
 def draw_text_box(text:str,width:int,fontsize:int,bold=False,fg=(255,255,255),bg=(0,0,0,150)):
-    f=font(fontsize,bold)
+    f=get_font(fontsize,bold)
     d=ImageDraw.Draw(Image.new("RGB",(10,10)))
     words=text.split(); lines=[]; cur=""
     for w in words:
@@ -234,7 +229,6 @@ def sentences_to_ssml(sents:List[str])->str:
     parts=[]
     for i,s in enumerate(sents):
         s=(s.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;"))
-        # beat aralarına bilinçli duraklar
         br="300ms" if i in (0,1) else "180ms"
         parts.append(f"<p>{s}</p><break time=\"{br}\"/>")
     return "".join(parts)
@@ -255,7 +249,6 @@ async def edge_ssml_async(sentences:List[str], outpath:str, voice:str):
                 s=off/10_000_000.0
                 e=s+max((dur or 0)/10_000_000.0,0.06)
                 if txt: timings.append((txt,s,e))
-    # normalize
     out=[]
     for w,s,e in timings:
         if e<=s: e=s+0.08
@@ -277,14 +270,9 @@ def tts_with_timings(sentences:List[str], narration:str, outpath:str, lang:str, 
 def master_voice(in_mp3:str, out_mp3:str):
     from pydub import AudioSegment, effects
     voice=AudioSegment.from_file(in_mp3)
-    # de-ess benzeri: 5–9 kHz yumuşat (basit LPF + mix)
     soft=voice.low_pass_filter(9000)
-    voice=soft
-    # HPF 120 Hz, LPF 8 kHz
-    voice=voice.high_pass_filter(120).low_pass_filter(8000)
-    # hafif kompresyon
+    voice=soft.high_pass_filter(120).low_pass_filter(8000)
     voice=effects.compress_dynamic_range(voice, threshold=-18.0, ratio=2.0, attack=5, release=50)
-    # normalize -14 LUFS civarı
     voice=effects.normalize(voice, headroom=14.0)
     voice.export(out_mp3, format="mp3")
 
@@ -292,17 +280,14 @@ def duck_ambience(narration_path:str, ambience_path:str, out_path:str, up_gain_d
     from pydub import AudioSegment
     nar=AudioSegment.from_file(narration_path)
     amb=AudioSegment.from_file(ambience_path)
-    if len(amb)<len(nar): amb=amb*int(math.ceil(len(nar)/len(amb)))
-    amb=amb[:len(nar)]
-    # basit duck: konuşma boyunca düşük, boşluklarda biraz daha yüksek
-    # sessizlik eşik: -42 dBFS altında
-    window=50  # ms
+    if len(amb)<len(nar): amb=amb*int(math.ceil(len(nar)/len(amb))); amb=amb[:len(nar)]
+    window=50
     mixed=[]
     for i in range(0, len(nar), window):
         slice_db = nar[i:i+window].dBFS if nar[i:i+window].rms>0 else -90
         gain = down_gain_db if slice_db>-42 else up_gain_db
         mixed.append(amb[i:i+window]+gain)
-    res = sum(mixed[0:1]) if mixed else amb+down_gain_db
+    res = mixed[0] if mixed else amb+down_gain_db
     for seg in mixed[1:]:
         res = res.append(seg, crossfade=5)
     res.export(out_path, format="mp3")
@@ -316,28 +301,34 @@ def fit_center_crop(img: Image.Image, w=W, h=H) -> Image.Image:
     L=(img.width-w)//2; T=(img.height-h)//2
     return img.crop((L,T,L+w,T+h))
 
-def apply_grade(img:Image.Image)->Image.Image:
-    # hafif sıcak ton + vignette + grain
+def apply_grade(img: Image.Image) -> Image.Image:
+    """Sıcak renk derecelendirme + vinyet + grain, GÖRSEL BOYUTUNA göre."""
+    w,h = img.size
+    # warm grade
     graded = ImageOps.colorize(ImageOps.grayscale(img), black="#0b0b0b", white="#f2e8da").convert("RGB")
     graded = Image.blend(img, graded, 0.18)
-    # vignette
-    vign = Image.new("L",(W,H),0)
-    vx=ImageDraw.Draw(vign)
-    for r in range(0, int(max(W,H)*0.75), 8):
-        alpha=int(255*min(1, (r/(max(W,H)*0.75))**2))
-        vx.ellipse((W//2-r, H//2-r, W//2+r, H//2+r), outline=alpha, width=8)
-    vign= vign.filter(ImageFilter.GaussianBlur(60))
-    graded.putalpha(255)
-    graded = Image.composite(graded, Image.new("RGBA",(W,H),(0,0,0,255)), vign.point(lambda p:255-p))
-    graded = graded.convert("RGB")
-    # grain
-    noise = (np.random.randn(H,W)*6+0).clip(-12,12).astype(np.int16)
-    arr = np.array(graded).astype(np.int16)
-    arr = np.clip(arr + noise[:,:,None], 0, 255).astype(np.uint8)
+
+    # vignette mask: kenarlarda güçlü, merkezde zayıf
+    mask = Image.new("L", (w, h), 160)  # kenarlar: koyu
+    draw = ImageDraw.Draw(mask)
+    margin = int(min(w, h) * 0.30)
+    draw.ellipse((margin, margin, w - margin, h - margin), fill=0)  # merkez: açık
+    mask = mask.filter(ImageFilter.GaussianBlur(80))
+
+    # overlay (siyah), mask'i alfa olarak kullan
+    overlay = Image.new("RGBA", (w, h), (0, 0, 0, 255))
+    overlay.putalpha(mask)
+    base = graded.convert("RGBA")
+    with_vignette = Image.alpha_composite(base, overlay).convert("RGB")
+
+    # film grain
+    noise = (np.random.randn(h, w) * 6).clip(-12, 12).astype(np.int16)
+    arr = np.array(with_vignette).astype(np.int16)
+    arr = np.clip(arr + noise[:, :, None], 0, 255).astype(np.uint8)
     return Image.fromarray(arr)
 
 def ken_burns_clip(img: Image.Image, duration: float, z0=1.05, z1=1.12):
-    base = fit_center_crop(apply_grade(img))
+    base = fit_center_crop(apply_grade(img), W, H)
     path="kb.jpg"; base.save(path,quality=92)
     clip=ImageClip(path).set_duration(duration)
     return clip.resize(lambda t: z0+(z1-z0)*(t/duration)).set_position(("center","center"))
@@ -365,7 +356,6 @@ def group_boundaries(bound:List[Tuple[str,float,float]], dur:float)->List[Tuple[
         else:
             txt=" ".join(x[0] for x in buf); chunks.append((txt, buf[0][1], buf[-1][2])); buf=[(w,s,e)]
     if buf: chunks.append((" ".join(x[0] for x in buf), buf[0][1], buf[-1][2]))
-    # sınırla
     out=[]
     for t,s,e in chunks:
         s=max(0.55,min(s,dur-0.3)); e=max(s+0.12,min(e,dur-0.2)); out.append((t,s,e))
@@ -396,25 +386,24 @@ def render(title:str, narration:str, sentences:List[str],
     voice = AudioFileClip(audio_path)
     duration = max(min(max(duration_hint,48),75), voice.duration+0.6)
 
-    # Görsel
+    # B-roll
     broll=build_broll(images, duration)
 
-    # Başlık
+    # Title
     title_png="title.png"; save_text_box(title[:64], title_png, width=W-140, fontsize=58, bold=True)
     title_clip=ImageClip(title_png).set_duration(min(5.0,duration*0.22)).set_position(("center",72)).fadein(0.3).fadeout(0.3)
 
-    # Altyazı
+    # Subtitles
     subs=[]
     chunks = group_boundaries(boundaries, voice.duration) if boundaries else fallback_chunks(narration, voice.duration)
     for i,(txt,s,e) in enumerate(chunks):
         fn=f"sub_{i:03d}.png"; save_text_box(txt, fn, width=W-220, fontsize=36, bold=False)
         subs.append(ImageClip(fn).set_start(s).set_duration(e-s).set_position(("center",H-340)).fadein(0.07).fadeout(0.07))
 
-    # Ambiyans + ducking
+    # Ambience (ducking)
     amb_custom = ASSETS_DIR/"ambience.mp3"
     amb_path = str(amb_custom) if amb_custom.exists() else None
-    # Mastered narration
-    mastered="voice_mastered.mp3"; 
+    mastered="voice_mastered.mp3"
     try:
         master_voice(audio_path, mastered)
         nar_clip = AudioFileClip(mastered)
@@ -430,12 +419,8 @@ def render(title:str, narration:str, sentences:List[str],
         except Exception:
             amb_clip = AudioFileClip(amb_path).volumex(0.14)
         audio_layers.append(amb_clip.set_duration(duration))
-    else:
-        # procedural ambience yoksa sessiz devam
-        pass
 
     comp_audio=CompositeAudioClip([a.fx(afx.audio_normalize) for a in audio_layers])
-
     comp = CompositeVideoClip([broll, title_clip, *subs]).set_audio(comp_audio).set_duration(duration)
 
     out = re.sub(r"[^-\w\s.,()]+","",title).strip().replace(" ","_")[:80] or "autoyuson_video"
