@@ -49,11 +49,50 @@ jobs:
           print("editor OK:", hasattr(m, "VideoFileClip"))
           PY
 
+      # 🔎 Preflight: Secrets var mı? (token boşsa job fail olsun; token'ı log'a basmıyoruz)
+      - name: Preflight secrets
+        env:
+          YT_CLIENT_ID: ${{ secrets.YT_CLIENT_ID }}
+          YT_CLIENT_SECRET: ${{ secrets.YT_CLIENT_SECRET }}
+          YT_REFRESH_TOKEN: ${{ secrets.YT_REFRESH_TOKEN }}
+          TOKEN_JSON_BASE64: ${{ secrets.TOKEN_JSON_BASE64 }}
+        run: |
+          python - << 'PY'
+          import os, sys, base64, json
+          cid = os.getenv("YT_CLIENT_ID","").strip()
+          cs  = os.getenv("YT_CLIENT_SECRET","").strip()
+          rt  = os.getenv("YT_REFRESH_TOKEN","").strip()
+          b64 = os.getenv("TOKEN_JSON_BASE4","") or os.getenv("TOKEN_JSON_BASE64","")
+          ok = True
+          if not (cid and cs and rt):
+              if not b64:
+                  print("ERROR: Missing secrets. Provide either:")
+                  print(" - YT_CLIENT_ID, YT_CLIENT_SECRET, YT_REFRESH_TOKEN")
+                  print("   or")
+                  print(" - TOKEN_JSON_BASE64 (base64 of token.json with refresh_token + client_id + client_secret)")
+                  ok = False
+              else:
+                  # hızlı doğrulama: base64 parse edilebiliyor mu?
+                  try:
+                      raw = base64.b64decode(b64).decode("utf-8")
+                      data = json.loads(raw)
+                      if not data.get("refresh_token"):
+                          print("ERROR: TOKEN_JSON_BASE64 present but refresh_token not found in JSON.")
+                          ok = False
+                  except Exception as e:
+                      print("ERROR: TOKEN_JSON_BASE64 invalid (cannot decode/parse).")
+                      ok = False
+          if not ok:
+              sys.exit(1)
+          print("Secrets preflight OK.")
+          PY
+
       - name: Run Autoyuson
         env:
           YT_CLIENT_ID: ${{ secrets.YT_CLIENT_ID }}
           YT_CLIENT_SECRET: ${{ secrets.YT_CLIENT_SECRET }}
           YT_REFRESH_TOKEN: ${{ secrets.YT_REFRESH_TOKEN }}
+          TOKEN_JSON_BASE64: ${{ secrets.TOKEN_JSON_BASE64 }}
           LANGUAGE: "en"
           VIDEO_DURATION: "55"
           TITLE_PREFIX: ""
@@ -68,5 +107,5 @@ jobs:
           if ! git diff --cached --quiet; then
             git commit -m "autoyuson: update seen topics"
             git push
-          else
+          else:
             echo "No changes to commit."
