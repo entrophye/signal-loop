@@ -34,11 +34,9 @@ jobs:
           python -m pip install --no-cache-dir numpy==1.26.4
           python -m pip install --no-cache-dir imageio==2.31.1 imageio-ffmpeg==0.4.8
           python -m pip install --no-cache-dir moviepy==1.0.3
-          # Pillow 9.5.0: ANTIALIAS sabit, MoviePy ile uyumlu
           python -m pip install --no-cache-dir pillow==9.5.0
           python -m pip install --no-cache-dir gTTS requests wikipedia \
             google-api-python-client google-auth-httplib2 google-auth-oauthlib
-          # Doğrulama
           python - << 'PY'
           import sys, moviepy, imageio, numpy
           import moviepy.editor as m
@@ -49,7 +47,6 @@ jobs:
           print("editor OK:", hasattr(m, "VideoFileClip"))
           PY
 
-      # 🔎 Preflight: Secrets var mı? (token boşsa job fail olsun; token'ı log'a basmıyoruz)
       - name: Preflight secrets
         env:
           YT_CLIENT_ID: ${{ secrets.YT_CLIENT_ID }}
@@ -62,25 +59,24 @@ jobs:
           cid = os.getenv("YT_CLIENT_ID","").strip()
           cs  = os.getenv("YT_CLIENT_SECRET","").strip()
           rt  = os.getenv("YT_REFRESH_TOKEN","").strip()
-          b64 = os.getenv("TOKEN_JSON_BASE4","") or os.getenv("TOKEN_JSON_BASE64","")
+          b64 = os.getenv("TOKEN_JSON_BASE64","").strip()
           ok = True
           if not (cid and cs and rt):
               if not b64:
                   print("ERROR: Missing secrets. Provide either:")
-                  print(" - YT_CLIENT_ID, YT_CLIENT_SECRET, YT_REFRESH_TOKEN")
-                  print("   or")
-                  print(" - TOKEN_JSON_BASE64 (base64 of token.json with refresh_token + client_id + client_secret)")
+                  print("  - YT_CLIENT_ID, YT_CLIENT_SECRET, YT_REFRESH_TOKEN")
+                  print("    or")
+                  print("  - TOKEN_JSON_BASE64 (base64 of token.json)")
                   ok = False
               else:
-                  # hızlı doğrulama: base64 parse edilebiliyor mu?
                   try:
                       raw = base64.b64decode(b64).decode("utf-8")
                       data = json.loads(raw)
                       if not data.get("refresh_token"):
-                          print("ERROR: TOKEN_JSON_BASE64 present but refresh_token not found in JSON.")
+                          print("ERROR: TOKEN_JSON_BASE64 present but no refresh_token in JSON.")
                           ok = False
                   except Exception as e:
-                      print("ERROR: TOKEN_JSON_BASE64 invalid (cannot decode/parse).")
+                      print("ERROR: TOKEN_JSON_BASE64 invalid.")
                       ok = False
           if not ok:
               sys.exit(1)
@@ -96,8 +92,8 @@ jobs:
           LANGUAGE: "en"
           VIDEO_DURATION: "55"
           TITLE_PREFIX: ""
-          CONTENT_THEME: "FACTUAL_SHORTS"
-        run: python main_autoyuson.py
+        run: |
+          python main_autoyuson.py
 
       - name: Commit seen topics (if changed)
         run: |
@@ -107,5 +103,5 @@ jobs:
           if ! git diff --cached --quiet; then
             git commit -m "autoyuson: update seen topics"
             git push
-          else:
+          else
             echo "No changes to commit."
