@@ -11,7 +11,6 @@ permissions:
 jobs:
   build-and-upload:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -28,19 +27,28 @@ jobs:
           sudo apt-get update -y
           sudo apt-get install -y ffmpeg
 
-      # 🔧 Zorla moviepy kurulumu (önce pip upgrade)
-      - name: Install Python dependencies
+      # 🔧 Tüm pip çağrılarını *aynı* Python'a yapıyoruz ve sürümleri sabitliyoruz
+      - name: Install Python dependencies (pinned)
         run: |
+          python -V
           python -m pip install --upgrade pip setuptools wheel
-          pip install --force-reinstall moviepy
-          pip install gTTS pillow requests wikipedia google-api-python-client google-auth-httplib2 google-auth-oauthlib
-
-      # Kontrol: gerçekten yüklenmiş mi?
-      - name: Verify installation
-        run: |
+          # numpy 2.x ile moviepy eski sürümlerde sorun çıkabiliyor, bu yüzden 1.26.x
+          python -m pip install --no-cache-dir numpy==1.26.4
+          # imageio ve ffmpeg köprüsü
+          python -m pip install --no-cache-dir imageio==2.31.1 imageio-ffmpeg==0.4.8
+          # Kararlı moviepy sürümü
+          python -m pip install --no-cache-dir moviepy==1.0.3
+          # Diğer bağımlılıklar
+          python -m pip install --no-cache-dir gTTS pillow requests wikipedia \
+            google-api-python-client google-auth-httplib2 google-auth-oauthlib
+          # Kurulum doğrulama
           python - << 'PY'
-          import moviepy.editor, gtts, PIL, requests, wikipedia
-          print("✅ MoviePy and all deps installed.")
+          import sys
+          print("Python:", sys.version)
+          import moviepy.editor as m, imageio, numpy, PIL, gtts, requests, wikipedia
+          print("moviepy:", m.__version__)
+          print("imageio:", imageio.__version__)
+          print("numpy:", numpy.__version__)
           PY
 
       - name: Run Autoyuson
@@ -51,6 +59,7 @@ jobs:
           LANGUAGE: "en"
           VIDEO_DURATION: "55"
           TITLE_PREFIX: ""
+          CONTENT_THEME: "FACTUAL_SHORTS"
         run: python main_autoyuson.py
 
       - name: Commit seen topics (if changed)
