@@ -8,9 +8,13 @@ AUTOYUSON — Factual Shorts (History / Space / Culture) for Yusonvasya
 - Konu tekrarını data/seen_topics.json ile azaltır, yüzlerce video için uygundur
 
 ENV (GitHub Secrets veya local env):
+  # Birincil yol:
   YT_CLIENT_ID
   YT_CLIENT_SECRET
   YT_REFRESH_TOKEN
+
+  # Yedek yol (bunlar boşsa çalışır):
+  TOKEN_JSON_BASE64   # token.json içeriğinin base64 hâli (içinden refresh_token, client_id, client_secret okunur)
 
 Opsiyonel ENV:
   LANGUAGE=en
@@ -20,7 +24,7 @@ Opsiyonel ENV:
   TOPICS_FILE=topics.txt
 """
 
-import os, io, re, json, random, textwrap, pathlib, sys
+import os, io, re, json, base64, random, textwrap, pathlib, sys
 from typing import List, Tuple, Optional
 from dataclasses import dataclass
 
@@ -205,6 +209,36 @@ def wrap_lines_for_subs(text: str, max_chars=52) -> List[str]:
         lines.extend([l for l in chunk.split("\n") if l.strip()])
     return lines
 
+# ---------- OAuth helpers ----------
+def _read_oauth_from_env_or_b64():
+    """
+    Önce doğrudan env değişkenlerine bakar (YT_CLIENT_ID / SECRET / REFRESH).
+    Bunlar boşsa, TOKEN_JSON_BASE64 varsa decode edip içinden değerleri çeker.
+    """
+    cid = os.getenv("YT_CLIENT_ID", "").strip()
+    csecret = os.getenv("YT_CLIENT_SECRET", "").strip()
+    rtoken = os.getenv("YT_REFRESH_TOKEN", "").strip()
+
+    if cid and csecret and rtoken:
+        return cid, csecret, rtoken
+
+    b64 = os.getenv("TOKEN_JSON_BASE64", "").strip()
+    if not b64:
+        # hiçbir şey yok
+        return cid, csecret, rtoken
+
+    try:
+        raw = base64.b64decode(b64).decode("utf-8")
+        data = json.loads(raw)
+        # token.json formatında beklenen alanlar:
+        # refresh_token, client_id, client_secret (bazı tool'larda client bilgileri ayrı dosyada olabilir)
+        rtoken2 = (data.get("refresh_token") or "").strip()
+        cid2 = (data.get("client_id") or cid).strip()
+        csecret2 = (data.get("client_secret") or csecret).strip()
+        return cid2 or cid, csecret2 or csecret, rtoken2 or rtoken
+    except Exception:
+        return cid, csecret, rtoken
+
 # ---------- Render ----------
 @dataclass
 class RenderResult:
@@ -276,9 +310,21 @@ def render_video(title: str, narration: str, bg_img: Image.Image, audio_path: st
 
 # ---------- YouTube ----------
 def build_youtube_service():
-    client_id = os.environ["YT_CLIENT_ID"]
-    client_secret = os.environ["YT_CLIENT_SECRET"]
-    refresh_token = os.environ["YT_REFRESH_TOKEN"]
+    # Secrets veya base64 token.json'dan oku
+    client_id, client_secret, refresh_token = _read_oauth_from_env_or_b64()
+    if not refresh_token:
+        raise RuntimeError("Missing refresh_token. Set YT_REFRESH_TOKEN or TOKEN_JSON_BASE64.")
+
+    # client_id / client_secret bazı durumlarda base64 token.json'da yok olabilir
+    if not client_id or not client_secret:
+        # Yoksa yine de deneyelim; çoğu projede lazım.
+        cid_env = os.getenv("YT_CLIENT_ID", "").strip()
+        cs_env  = os.getenv("YT_CLIENT_SECRET", "").strip()
+        client_id = client_id or cid_env
+        client_secret = client_secret or cs_env
+        if not client_id or not client_secret:
+            raise RuntimeError("Missing client_id/client_secret. Provide YT_CLIENT_ID / YT_CLIENT_SECRET or include them in TOKEN_JSON_BASE64.")
+
     creds = Credentials(token=None, refresh_token=refresh_token,
                         token_uri="https://oauth2.googleapis.com/token",
                         client_id=client_id, client_secret=client_secret,
