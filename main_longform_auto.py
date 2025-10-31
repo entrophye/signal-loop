@@ -15,7 +15,7 @@ from moviepy.editor import (
     ImageClip, AudioFileClip, CompositeVideoClip, VideoClip,
     concatenate_videoclips
 )
-from moviepy.video.fx.all import crop, fadein  # crossfadein yok, MoviePy 1.0.3 uyumu
+from moviepy.video.fx.all import crop, fadein  # MoviePy 1.0.3 uyumlu
 
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
@@ -29,8 +29,8 @@ from google.auth.transport.requests import Request
 load_dotenv()
 ROOT = Path(__file__).parent
 DATA = ROOT / "data"
-OVERLAYS = DATA / "overlays"
-SCENE_ASSETS = DATA / "scene_assets"
+OVERLAYS = DATA / "overlays"         # opsiyonel
+SCENE_ASSETS = DATA / "scene_assets" # indirilen/generatif görseller
 AUTOSEEDS = DATA / "autoseeds.txt"
 OUT = ROOT / "out"
 for p in (DATA, OVERLAYS, SCENE_ASSETS, OUT):
@@ -38,6 +38,7 @@ for p in (DATA, OVERLAYS, SCENE_ASSETS, OUT):
 
 LANG = os.getenv("LANG", "en")
 TARGET_W, TARGET_H = 720, 1280
+ASPECT = TARGET_W / TARGET_H
 VIDEO_DURATION_CAP = int(os.getenv("VIDEO_DURATION", "120"))
 SCENES_MIN = int(os.getenv("SCENES_MIN", "7"))
 SCENES_MAX = int(os.getenv("SCENES_MAX", "10"))
@@ -55,6 +56,9 @@ BASE_SEEDS = [
     "The choir is a machine misfiring a prayer.",
     "Report says light is safe; the light disagrees.",
     "If you hear the Pulse, do not count with it; it counts you.",
+    "The archive listens back.",
+    "Numbers bled into shapes; shapes learned to pray.",
+    "We drew a circle around the last signal and stepped inside."
 ]
 HOOKS = [
     "Transmission begins.",
@@ -111,6 +115,7 @@ def make_script_longform():
         "The Pulse counts backwards.",
         "No maps survived the light.",
         "Silence replied in numbers.",
+        "The archive listens back."
     ])
     pieces = [hook] + discovery + escalation + revelation + [tag]
     full = " ".join(" ".join(pieces).split())
@@ -159,10 +164,6 @@ def _drone(duration_ms, freq=62.0, vol_db=-24):
     return AudioSegment(data=wave, sample_width=2, frame_rate=sr, channels=1) + vol_db
 
 def tts_chunks_and_concatenate(lines):
-    """
-    Her sahne için ayrı TTS üret → gerçek süreleri al → concat et.
-    Döner: combined_path, durations_sec(list), per_chunk_paths(list)
-    """
     chunk_paths, durations = [], []
     for i, txt in enumerate(lines):
         path = OUT / f"tts_{i:02d}_{uuid.uuid4().hex[:4]}.mp3"
@@ -214,11 +215,11 @@ def caption_png(text: str, width=900, padding=26):
     return out
 
 # =========================
-# WIKIMEDIA FETCH PER SCENE
+# IMAGE FETCH & PROCEDURAL
 # =========================
 COMMONS_ENDPOINT = "https://commons.wikimedia.org/w/api.php"
 
-def fetch_one_image(query: str, w=TARGET_W, timeout=10):
+def fetch_one_image(query: str, w=TARGET_W, timeout=8):
     params = {
         "action":"query","format":"json","generator":"search",
         "gsrsearch":query,"gsrlimit":"1","gsrnamespace":"6",
@@ -232,7 +233,7 @@ def fetch_one_image(query: str, w=TARGET_W, timeout=10):
             url = info.get("thumburl") or info.get("url")
             if url and url.lower().endswith((".jpg",".jpeg",".png")):
                 raw = requests.get(url, timeout=timeout); raw.raise_for_status()
-                name = f"{uuid.uuid4().hex[:8]}_{query.replace(' ','_')}.jpg"
+                name = f"{uuid.uuid4().hex[:8]}_{re.sub(r'[^a-zA-Z0-9_]+','_', query)}.jpg"
                 path = SCENE_ASSETS / name
                 path.write_bytes(raw.content)
                 return str(path)
@@ -248,6 +249,7 @@ def gen_procedural_still(path: Path, w=TARGET_W, h=TARGET_H):
     noise = np.random.normal(0, 6, (h, w))
     img = np.clip(band+noise, 0, 255).astype(np.uint8)
     im = Image.fromarray(img).convert("RGB").filter(ImageFilter.GaussianBlur(1.2))
+    # vignette
     vign = Image.new("L",(w,h),0); vd = ImageDraw.Draw(vign)
     vd.ellipse((-int(w*0.2),-int(h*0.2),int(w*1.2),int(h*1.2)), fill=255)
     vign = vign.filter(ImageFilter.GaussianBlur(80))
@@ -271,29 +273,71 @@ def ensure_scene_images_for_line(line: str, need=2):
 # =========================
 # SCENE BUILDERS
 # =========================
-def kenburns_clip(img_path: str, dur: float):
-    clip = ImageClip(img_path).resize(height=TARGET_H).set_duration(dur)
+def fit_and_fill(clip: ImageClip):
+    """Görüntüyü 9:16'ya taşma olmadan doldur (cover)."""
     w, h = clip.size
-    z = clip.fx(crop, x1=0, y1=0, x2=w, y2=h).resize(lambda t: 1.03 + 0.01 * t)
+    in_aspect = w / h
+    if in_aspect > ASPECT:
+        # çok geniş → yüksekliği sabitle, genişten crop
+        clip = clip.resize(height=TARGET_H)
+        w2, h2 = clip.size
+        new_w = int(TARGET_H * ASPECT)
+        x1 = (w2 - new_w) // 2
+        clip = crop(clip, x1=x1, y1=0, x2=x1+new_w, y2=TARGET_H)
+    else:
+        # çok dar → genişliği sabitle, yükseklikten crop
+        clip = clip.resize(width=TARGET_W)
+        w2, h2 = clip.size
+        new_h = int(TARGET_W / ASPECT)
+        y1 = (h2 - new_h) // 2
+        clip = crop(clip, x1=0, y1=y1, x2=TARGET_W, y2=y1+new_h)
+    return clip.set_duration(clip.duration)
+
+def kenburns_clip(img_path: str, dur: float):
+    clip = ImageClip(img_path).set_duration(dur)
+    clip = fit_and_fill(clip)
+    # hafif pan/zoom
+    z = clip.resize(lambda t: 1.03 + 0.01 * t)
     return z
+
+def animated_fallback_bg(duration: float):
+    """Asla siyah ekran olmasın diye düşük masraflı animasyonlu arka plan."""
+    def make_frame(t):
+        # yumuşak dalga + rasgele noise
+        y = np.linspace(0, 1, TARGET_H).reshape(-1, 1)
+        x = np.linspace(0, 1, TARGET_W).reshape(1, -1)
+        band = (np.sin(2*np.pi*(y*1.2 + 0.08*t)) * 0.5 + 0.5)
+        band2 = (np.cos(2*np.pi*(x*1.0 - 0.06*t)) * 0.5 + 0.5)
+        base = (band*0.6 + band2*0.4)
+        noise = np.random.normal(0, 0.02, (TARGET_H, TARGET_W))
+        img = np.clip((base + noise) * 30 + 8, 0, 255).astype(np.uint8)
+        frame = np.stack([img, img, img], axis=2)
+        return frame
+    return VideoClip(make_frame, duration=duration).set_duration(duration)
 
 def scene_from_images(img_paths, dur: float):
     """
     2 görsel → her biri yarım süre.
-    İkincisi ~0.6 sn 'fade-in' alır ve bir öncekinin son 0.6 sn'si üzerine bindirilir
-    → MoviePy 1.0.3 ile yumuşak crossfade etkisi.
+    İkincisi ~0.6 sn fade-in alır ve bir öncekinin son 0.6 sn'si üzerine biner.
+    Altta daima animasyonlu fallback var (görsel olsa da olmasa da).
     """
+    xfade = min(0.6, max(0.8, dur/2.0) * 0.4)
+    bg = animated_fallback_bg(dur)
+
+    if not img_paths:
+        return bg
+
     if len(img_paths) == 1:
-        return kenburns_clip(img_paths[0], dur)
+        a = kenburns_clip(img_paths[0], dur).set_start(0)
+        comp = CompositeVideoClip([bg, a], size=(TARGET_W, TARGET_H)).set_duration(dur)
+        return comp
 
     half = max(0.8, (dur / 2.0))
-    xfade = min(0.6, half * 0.4)
-
     a = kenburns_clip(img_paths[0], half).set_start(0)
     b = kenburns_clip(img_paths[1], half)
     b = fadein(b, xfade).set_start(half - xfade)
 
-    comp = CompositeVideoClip([a, b], size=(TARGET_W, TARGET_H))
+    comp = CompositeVideoClip([bg, a, b], size=(TARGET_W, TARGET_H))
     comp = comp.set_duration(half + half)
     return comp
 
@@ -325,6 +369,14 @@ def upload_to_youtube(path_mp4, title, desc, tags):
 # =========================
 # ORCHESTRATOR
 # =========================
+DYNAMIC_TITLES = [
+    "SIGNAL ARCHIVE — Whisper Archive",
+    "SIGNAL ARCHIVE — The Pulse Beneath",
+    "SIGNAL ARCHIVE — Eclipsera Relay",
+    "SIGNAL ARCHIVE — Cathedrals of Static",
+    "SIGNAL ARCHIVE — Numbers that Breathe"
+]
+
 def run_pipeline():
     uid = uuid.uuid4().hex[:6]
 
@@ -334,7 +386,7 @@ def run_pipeline():
     caps = caps_all[:target_scene_count]
 
     # 2) TTS her sahne için ayrı → concat → süre listesi
-    voice_path, durations, per_chunk = tts_chunks_and_concatenate(caps)
+    voice_path, durations, _ = tts_chunks_and_concatenate(caps)
     total_voice_sec = sum(durations)
     if total_voice_sec > VIDEO_DURATION_CAP:
         overflow = total_voice_sec - VIDEO_DURATION_CAP
@@ -345,7 +397,7 @@ def run_pipeline():
             durations.pop(); caps.pop()
             total_voice_sec = sum(durations)
 
-    # 3) Her sahneye uygun görselleri getir
+    # 3) Her sahneye uygun görselleri getir + caption
     all_scene_clips = []
     t_cursor = 0.0
     for i, (cap, dur) in enumerate(zip(caps, durations)):
@@ -358,7 +410,7 @@ def run_pipeline():
         all_scene_clips += [base, cap_clip]
         t_cursor += dur
 
-    # 4) Composite + Audio
+    # 4) Composite + Audio (altta yine güvenlik için tam süre fallback da ekleyebiliriz ama sahneler onu içeriyor)
     timeline = CompositeVideoClip(all_scene_clips, size=(TARGET_W, TARGET_H))
     aclip = AudioFileClip(voice_path)
     timeline = timeline.set_audio(aclip).set_duration(total_voice_sec)
@@ -371,16 +423,20 @@ def run_pipeline():
         ffmpeg_params=["-preset", "veryfast", "-tune", "stillimage"]
     )
 
-    # 6) Seed evrimi
+    # 6) Seed evrimi (tam otonom içerik değişimi)
     evolve_and_store(caps)
 
-    # 7) YouTube upload — TARİH YOK, sadece başlık
-    title = f"SIGNAL ARCHIVE — {random.choice(['The Pulse Beneath','Whisper Archive','Eclipsera'])}"
+    # 7) YouTube upload — TARİH YOK, başlık değişken
+    title = random.choice(DYNAMIC_TITLES)
+    # açıklama da hafif değişsin
     desc = (
-        "From the T-3012 archives. God is not gone. He's buried.\n\n"
+        f"{random.choice(['Recovered long-range transmission.',
+                          'Field log stitched from T-3012 archives.',
+                          'A relay caught between static and prayer.'])}\n\n"
+        "God is not gone. He's buried.\n"
         "Automated longform transmission."
     )
-    tags = ["godfinders","ai","cosmic horror","existential","longform"]
+    tags = ["godfinders","ai","cosmic horror","existential","longform","eclipsera","signal"]
 
     vid = upload_to_youtube(mp4, title, desc, tags)
     print("Uploaded video ID:", vid)
