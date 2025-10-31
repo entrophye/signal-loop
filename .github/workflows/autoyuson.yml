@@ -37,7 +37,7 @@ jobs:
           python -m pip install --no-cache-dir pillow==9.5.0
           python -m pip install --no-cache-dir edge-tts aiofiles
           python -m pip install --no-cache-dir gTTS requests google-api-python-client google-auth-httplib2 google-auth-oauthlib
-          python -m pip install --no-cache-dir soundfile  # procedural ambient için
+          python -m pip install --no-cache-dir soundfile
           python - << 'PY'
           import sys, moviepy, imageio, numpy
           import moviepy.editor as m
@@ -93,7 +93,7 @@ jobs:
           LANGUAGE: "en"
           VIDEO_DURATION: "55"
           TITLE_PREFIX: ""
-          EDGE_TTS_VOICE: "en-US-AriaNeural"
+          EDGE_TTS_VOICE: "en-US-JennyNeural"
         run: |
           python main_autoyuson.py
 
