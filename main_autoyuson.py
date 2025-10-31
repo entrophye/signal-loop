@@ -2,12 +2,12 @@
 AUTOYUSON — Factual Shorts (History / Space / Culture) for Yusonvasya
 - Wikipedia'dan doğrulanabilir özet + kaynak URL
 - gTTS ile seslendirme
-- PIL ile metin (başlık + altyazı) PNG oluşturma (ImageMagick YOK)
-- MoviePy ile 1080x1920 video
+- PIL ile metin (başlık + altyazı) PNG; ImageMagick KULLANILMAZ
+- MoviePy ile 1080x1920 video (Shorts)
 - YouTube'a yükleme (Education=27), başlıkta tarih YOK
-- Konu tekrarını data/seen_topics.json ile azaltır
+- Konu tekrarını data/seen_topics.json ile azaltır, yüzlerce video için uygundur
 
-ENV (GitHub Secrets):
+ENV (GitHub Secrets veya local env):
   YT_CLIENT_ID
   YT_CLIENT_SECRET
   YT_REFRESH_TOKEN
@@ -20,12 +20,21 @@ Opsiyonel ENV:
   TOPICS_FILE=topics.txt
 """
 
-import os, io, re, json, random, textwrap, pathlib, sys, tempfile
+import os, io, re, json, random, textwrap, pathlib, sys
 from typing import List, Tuple, Optional
 from dataclasses import dataclass
 
 import requests
 from PIL import Image, ImageDraw, ImageFont
+# Pillow 10+ uyumluluk şimi (ANTIALIAS kaldırıldıysa LANCZOS'a işaret et)
+try:
+    _ = Image.ANTIALIAS  # type: ignore[attr-defined]
+except AttributeError:
+    try:
+        Image.ANTIALIAS = Image.Resampling.LANCZOS  # type: ignore[attr-defined]
+    except Exception:
+        pass
+
 from gtts import gTTS
 from moviepy.editor import ImageClip, AudioFileClip, CompositeVideoClip, CompositeAudioClip, afx
 from moviepy.video.fx.all import resize as mp_resize
@@ -127,12 +136,12 @@ def is_factual_enough(text: str) -> bool:
     if any(w in text.lower() for w in bad): return False
     n = len(text.split()); return 80 <= n <= 200
 
-# ---------- Fonts (no ImageMagick) ----------
+# ---------- Fonts ----------
 N_REG = FONTS_DIR / "NotoSans-Regular.ttf"
 N_BOLD = FONTS_DIR / "NotoSans-Bold.ttf"
 
 def ensure_fonts():
-    # Google Fonts kaynakları
+    # Hafif, güvenli: NotoSans
     srcs = {
         N_REG: "https://github.com/googlefonts/noto-fonts/raw/main/hinted/ttf/NotoSans/NotoSans-Regular.ttf",
         N_BOLD:"https://github.com/googlefonts/noto-fonts/raw/main/hinted/ttf/NotoSans/NotoSans-Bold.ttf"
@@ -177,6 +186,8 @@ def pil_text_image(text: str, width: int, fontsize: int, bold: bool=False, fill=
     for ln in lines:
         w,_ = draw.textsize(ln, font=font)
         x = (width - w)//2
+        # hafif siyah gölge
+        draw.text((x+2, y+2), ln, font=font, fill=(0,0,0,160))
         draw.text((x, y), ln, font=font, fill=fill)
         y += line_h
     return img
@@ -223,7 +234,7 @@ def render_video(title: str, narration: str, bg_img: Image.Image, audio_path: st
 
     bg_clip = ImageClip(bg_path).set_duration(duration).fx(mp_resize, 1.06)
 
-    # Title (PNG)
+    # Title (PNG, üstte kısa)
     title_png = "title.png"
     save_text_png(title[:64], title_png, width=W-140, fontsize=72, bold=True)
     title_clip = ImageClip(title_png).set_duration(4.0).set_position(("center", 80)).fadein(0.3).fadeout(0.3)
