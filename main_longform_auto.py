@@ -1,7 +1,6 @@
 # main_longform_auto.py
 import os, random, uuid, textwrap, re
 from pathlib import Path
-from datetime import datetime
 
 import numpy as np
 import requests
@@ -12,8 +11,7 @@ from pydub import AudioSegment
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
 
 from moviepy.editor import (
-    ImageClip, AudioFileClip, CompositeVideoClip, VideoClip,
-    concatenate_videoclips
+    ImageClip, AudioFileClip, CompositeVideoClip, VideoClip
 )
 from moviepy.video.fx.all import crop, fadein  # MoviePy 1.0.3 uyumlu
 
@@ -23,17 +21,14 @@ from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 
 
-# =========================
-# ENV & PATHS
-# =========================
+# ============== ENV & PATHS ==============
 load_dotenv()
 ROOT = Path(__file__).parent
 DATA = ROOT / "data"
-OVERLAYS = DATA / "overlays"         # opsiyonel
-SCENE_ASSETS = DATA / "scene_assets" # indirilen/generatif görseller
+SCENE_ASSETS = DATA / "scene_assets"
 AUTOSEEDS = DATA / "autoseeds.txt"
 OUT = ROOT / "out"
-for p in (DATA, OVERLAYS, SCENE_ASSETS, OUT):
+for p in (DATA, SCENE_ASSETS, OUT):
     p.mkdir(exist_ok=True)
 
 LANG = os.getenv("LANG", "en")
@@ -43,9 +38,7 @@ VIDEO_DURATION_CAP = int(os.getenv("VIDEO_DURATION", "120"))
 SCENES_MIN = int(os.getenv("SCENES_MIN", "7"))
 SCENES_MAX = int(os.getenv("SCENES_MAX", "10"))
 
-# =========================
-# SEEDS / SCRIPT
-# =========================
+# ============== SEEDS / SCRIPT ==============
 BASE_SEEDS = [
     "God is not gone. He's buried.",
     "The Pulse counts backwards.",
@@ -118,14 +111,11 @@ def make_script_longform():
         "The archive listens back."
     ])
     pieces = [hook] + discovery + escalation + revelation + [tag]
-    full = " ".join(" ".join(pieces).split())
-    if len(full) > 900: full = full[:897] + "…"
     caps = [hook] + [s if len(s) <= 90 else s[:87]+"…" for s in (discovery+escalation+revelation)] + [tag]
+    full = " ".join(" ".join(pieces).split())
     return full, caps
 
-# =========================
-# SIMPLE KEYWORDING
-# =========================
+# ============== KEYWORDING ==============
 KW_MAP = {
     r"\b(pulse|signal|frequency|static)\b": ["oscilloscope", "astronomy radio", "deep space", "waveform"],
     r"\b(god|divine|prayer|cathedral|ritual)\b": ["cathedral ruin", "ancient temple", "monastery night"],
@@ -145,9 +135,7 @@ def extract_keywords(line: str):
         qs = ["eclipse", "alien landscape", "ruins night", "galaxy", "nebula"]
     return list(dict.fromkeys(qs))[:3]
 
-# =========================
-# AUDIO DESIGN (PER-CHUNK)
-# =========================
+# ============== AUDIO (PER-CHUNK) ==============
 def _pitch_down(seg, semitones=-2.5):
     new_fr = int(seg.frame_rate * (2.0 ** (semitones / 12.0)))
     return seg._spawn(seg.raw_data, overrides={"frame_rate": new_fr}).set_frame_rate(seg.frame_rate)
@@ -187,9 +175,7 @@ def tts_chunks_and_concatenate(lines):
     mix.export(out_path, format="mp3")
     return out_path, durations, chunk_paths
 
-# =========================
-# CAPTION PNG
-# =========================
+# ============== CAPTION PNG ==============
 def caption_png(text: str, width=900, padding=26):
     wrapped = textwrap.fill(text, 28)
     try:
@@ -201,12 +187,12 @@ def caption_png(text: str, width=900, padding=26):
     bbox = d.multiline_textbbox((0, 0), wrapped, font=font, align="center", spacing=6)
     w, h = bbox[2]-bbox[0], bbox[3]-bbox[1]
     img = Image.new("RGBA", (width+2*padding, h+2*padding), (0,0,0,0))
-    # gölge
+    # shadow
     sd = ImageDraw.Draw(img)
     for ox, oy in ((1,1),(2,2),(-1,1),(1,-1),(-2,-2)):
         sd.multiline_text((img.width//2+ox, padding+oy), wrapped, font=font, fill=(0,0,0,160),
                           align="center", anchor="ma", spacing=6)
-    # beyaz
+    # white
     d2 = ImageDraw.Draw(img)
     d2.multiline_text((img.width//2, padding), wrapped, font=font, fill=(255,255,255,255),
                       align="center", anchor="ma", spacing=6)
@@ -214,30 +200,45 @@ def caption_png(text: str, width=900, padding=26):
     img.save(out)
     return out
 
-# =========================
-# IMAGE FETCH & PROCEDURAL
-# =========================
+# ============== IMAGE FETCH & PROCEDURAL ==============
 COMMONS_ENDPOINT = "https://commons.wikimedia.org/w/api.php"
+HTTP_HEADERS = {
+    "User-Agent": "SignalLoopBot/1.0 (contact: example@example.com)",
+    "Accept": "application/json",
+    "Referer": "https://commons.wikimedia.org/",
+}
 
-def fetch_one_image(query: str, w=TARGET_W, timeout=8):
+def fetch_one_image(query: str, w=TARGET_W, timeout=10):
     params = {
-        "action":"query","format":"json","generator":"search",
-        "gsrsearch":query,"gsrlimit":"1","gsrnamespace":"6",
-        "prop":"imageinfo","iiprop":"url","iiurlwidth":str(w)
+        "action": "query",
+        "format": "json",
+        "generator": "search",
+        "gsrsearch": query,
+        "gsrlimit": "1",
+        "gsrnamespace": "6",
+        "prop": "imageinfo",
+        "iiprop": "url",
+        "iiurlwidth": str(w),
+        "origin": "*",
     }
     try:
-        r = requests.get(COMMONS_ENDPOINT, params=params, timeout=timeout); r.raise_for_status()
-        data = r.json(); pages = data.get("query", {}).get("pages", {})
+        r = requests.get(COMMONS_ENDPOINT, params=params, headers=HTTP_HEADERS, timeout=timeout)
+        r.raise_for_status()
+        data = r.json()
+        pages = data.get("query", {}).get("pages", {})
         for _, p in pages.items():
             info = p.get("imageinfo", [{}])[0]
             url = info.get("thumburl") or info.get("url")
-            if url and url.lower().endswith((".jpg",".jpeg",".png")):
-                raw = requests.get(url, timeout=timeout); raw.raise_for_status()
+            if url and url.lower().endswith((".jpg", ".jpeg", ".png")):
+                raw = requests.get(url, headers=HTTP_HEADERS, timeout=timeout)
+                raw.raise_for_status()
                 name = f"{uuid.uuid4().hex[:8]}_{re.sub(r'[^a-zA-Z0-9_]+','_', query)}.jpg"
                 path = SCENE_ASSETS / name
                 path.write_bytes(raw.content)
+                print(f"[image] fetched: {query} -> {name}")
                 return str(path)
-    except Exception:
+    except Exception as e:
+        print(f"[image] fetch fail: {query} ({e})")
         return None
     return None
 
@@ -259,6 +260,7 @@ def gen_procedural_still(path: Path, w=TARGET_W, h=TARGET_H):
 
 def ensure_scene_images_for_line(line: str, need=2):
     queries = extract_keywords(line)
+    print(f"[scene] keywords for '{line[:40]}...': {queries}")
     paths = []
     for q in queries:
         got = fetch_one_image(q)
@@ -268,24 +270,20 @@ def ensure_scene_images_for_line(line: str, need=2):
         tmp = SCENE_ASSETS / f"proc_{uuid.uuid4().hex[:6]}.jpg"
         gen_procedural_still(tmp)
         paths.append(str(tmp))
+        print(f"[image] procedural: {tmp.name}")
     return paths[:need]
 
-# =========================
-# SCENE BUILDERS
-# =========================
+# ============== SCENE BUILDERS ==============
 def fit_and_fill(clip: ImageClip):
-    """Görüntüyü 9:16'ya taşma olmadan doldur (cover)."""
     w, h = clip.size
     in_aspect = w / h
     if in_aspect > ASPECT:
-        # çok geniş → yüksekliği sabitle, genişten crop
         clip = clip.resize(height=TARGET_H)
         w2, h2 = clip.size
         new_w = int(TARGET_H * ASPECT)
         x1 = (w2 - new_w) // 2
         clip = crop(clip, x1=x1, y1=0, x2=x1+new_w, y2=TARGET_H)
     else:
-        # çok dar → genişliği sabitle, yükseklikten crop
         clip = clip.resize(width=TARGET_W)
         w2, h2 = clip.size
         new_h = int(TARGET_W / ASPECT)
@@ -296,14 +294,10 @@ def fit_and_fill(clip: ImageClip):
 def kenburns_clip(img_path: str, dur: float):
     clip = ImageClip(img_path).set_duration(dur)
     clip = fit_and_fill(clip)
-    # hafif pan/zoom
-    z = clip.resize(lambda t: 1.03 + 0.01 * t)
-    return z
+    return clip.resize(lambda t: 1.03 + 0.01 * t)
 
 def animated_fallback_bg(duration: float):
-    """Asla siyah ekran olmasın diye düşük masraflı animasyonlu arka plan."""
     def make_frame(t):
-        # yumuşak dalga + rasgele noise
         y = np.linspace(0, 1, TARGET_H).reshape(-1, 1)
         x = np.linspace(0, 1, TARGET_W).reshape(1, -1)
         band = (np.sin(2*np.pi*(y*1.2 + 0.08*t)) * 0.5 + 0.5)
@@ -313,16 +307,11 @@ def animated_fallback_bg(duration: float):
         img = np.clip((base + noise) * 30 + 8, 0, 255).astype(np.uint8)
         frame = np.stack([img, img, img], axis=2)
         return frame
-    return VideoClip(make_frame, duration=duration).set_duration(duration)
+    return VideoClip(make_frame, duration=duration)
 
 def scene_from_images(img_paths, dur: float):
-    """
-    2 görsel → her biri yarım süre.
-    İkincisi ~0.6 sn fade-in alır ve bir öncekinin son 0.6 sn'si üzerine biner.
-    Altta daima animasyonlu fallback var (görsel olsa da olmasa da).
-    """
     xfade = min(0.6, max(0.8, dur/2.0) * 0.4)
-    bg = animated_fallback_bg(dur)
+    bg = animated_fallback_bg(dur).set_start(0)
 
     if not img_paths:
         return bg
@@ -341,9 +330,7 @@ def scene_from_images(img_paths, dur: float):
     comp = comp.set_duration(half + half)
     return comp
 
-# =========================
-# YOUTUBE
-# =========================
+# ============== YOUTUBE ==============
 def youtube_service():
     client_id = os.getenv("YOUTUBE_CLIENT_ID")
     client_secret = os.getenv("YOUTUBE_CLIENT_SECRET")
@@ -366,9 +353,7 @@ def upload_to_youtube(path_mp4, title, desc, tags):
     media = MediaFileUpload(path_mp4, chunksize=-1, resumable=True)
     return youtube.videos().insert(part=",".join(body.keys()), body=body, media_body=media).execute().get("id")
 
-# =========================
-# ORCHESTRATOR
-# =========================
+# ============== ORCHESTRATOR ==============
 DYNAMIC_TITLES = [
     "SIGNAL ARCHIVE — Whisper Archive",
     "SIGNAL ARCHIVE — The Pulse Beneath",
@@ -380,12 +365,12 @@ DYNAMIC_TITLES = [
 def run_pipeline():
     uid = uuid.uuid4().hex[:6]
 
-    # 1) Metin + sahne başlıkları
-    full_text, caps_all = make_script_longform()
+    # 1) Script
+    _, caps_all = make_script_longform()
     target_scene_count = max(5, min(len(caps_all), random.randint(SCENES_MIN, SCENES_MAX)))
     caps = caps_all[:target_scene_count]
 
-    # 2) TTS her sahne için ayrı → concat → süre listesi
+    # 2) TTS → süre listesi
     voice_path, durations, _ = tts_chunks_and_concatenate(caps)
     total_voice_sec = sum(durations)
     if total_voice_sec > VIDEO_DURATION_CAP:
@@ -397,7 +382,7 @@ def run_pipeline():
             durations.pop(); caps.pop()
             total_voice_sec = sum(durations)
 
-    # 3) Her sahneye uygun görselleri getir + caption
+    # 3) Görseller + captions
     all_scene_clips = []
     t_cursor = 0.0
     for i, (cap, dur) in enumerate(zip(caps, durations)):
@@ -410,7 +395,7 @@ def run_pipeline():
         all_scene_clips += [base, cap_clip]
         t_cursor += dur
 
-    # 4) Composite + Audio (altta yine güvenlik için tam süre fallback da ekleyebiliriz ama sahneler onu içeriyor)
+    # 4) Composite + Audio
     timeline = CompositeVideoClip(all_scene_clips, size=(TARGET_W, TARGET_H))
     aclip = AudioFileClip(voice_path)
     timeline = timeline.set_audio(aclip).set_duration(total_voice_sec)
@@ -423,12 +408,11 @@ def run_pipeline():
         ffmpeg_params=["-preset", "veryfast", "-tune", "stillimage"]
     )
 
-    # 6) Seed evrimi (tam otonom içerik değişimi)
+    # 6) Seed evrimi
     evolve_and_store(caps)
 
-    # 7) YouTube upload — TARİH YOK, başlık değişken
+    # 7) YouTube (tarih yok; her koşuda değişken)
     title = random.choice(DYNAMIC_TITLES)
-    # açıklama da hafif değişsin
     desc = (
         f"{random.choice(['Recovered long-range transmission.',
                           'Field log stitched from T-3012 archives.',
