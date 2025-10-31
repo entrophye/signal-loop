@@ -1,5 +1,5 @@
 # main_longform_auto.py
-import os, random, uuid, textwrap, re
+import os, random, uuid, textwrap, re, hashlib
 from pathlib import Path
 
 import numpy as np
@@ -27,6 +27,7 @@ ROOT = Path(__file__).parent
 DATA = ROOT / "data"
 SCENE_ASSETS = DATA / "scene_assets"
 AUTOSEEDS = DATA / "autoseeds.txt"
+HISTORY = DATA / "history.log"
 OUT = ROOT / "out"
 for p in (DATA, SCENE_ASSETS, OUT):
     p.mkdir(exist_ok=True)
@@ -56,14 +57,23 @@ BASE_SEEDS = [
 HOOKS = [
     "Transmission begins.",
     "Archive fragment recovered.",
-    "Field log: Eclipsera — Sector Hell’s Eve.",
-    "After the collapse, we listened.",
+    "Field log: Eclipsera — Sector Hell's Eve.",
+    "After the collapse, we listened."
 ]
 REPLACE_MAP = {
     "God": "the divine", "light": "signal", "darkness": "static",
     "soil": "veil", "bones": "wires", "blood": "current",
     "song": "frequency", "prayer": "protocol",
 }
+
+TITLE_ADJ = [
+    "Whisper", "Pulse", "Static", "Axiom", "Veil", "Cathedral",
+    "Depth", "Relay", "Ashen", "Hollow", "Archive", "Orbit"
+]
+TITLE_CORE = [
+    "Archive", "Transmission", "Relay", "Protocol", "Litany",
+    "Signal", "Hypostasis", "Strain", "Breath", "Canticle"
+]
 
 def load_seeds():
     lines = []
@@ -74,17 +84,19 @@ def load_seeds():
                 lines.append(s)
     if not lines:
         lines = BASE_SEEDS[:]
+    # benzersiz sırayı koru
     return list(dict.fromkeys(lines))
 
 def mutate_line(s: str) -> str:
     words = s.split()
-    if not words: return s
+    if not words:
+        return s
     for i, w in enumerate(words):
         key = w.strip(".,;:!?\"'")
         if key in REPLACE_MAP and random.random() < 0.25:
             words[i] = w.replace(key, REPLACE_MAP[key])
     if random.random() < 0.15 and len(words) > 4:
-        j = random.randrange(1, len(words)-1)
+        j = random.randrange(1, len(words) - 1)
         words.insert(j, random.choice(["slowly", "again", "beneath"]))
     return " ".join(words)
 
@@ -97,22 +109,73 @@ def evolve_and_store(new_lines):
             out.append(m)
     AUTOSEEDS.write_text("\n".join(out[-500:]), encoding="utf-8")
 
+def _hash_signature(lines):
+    sig = "||".join(lines).encode("utf-8", errors="ignore")
+    return hashlib.sha256(sig).hexdigest()
+
+def _history_load():
+    if not HISTORY.exists():
+        return []
+    return [ln.strip() for ln in HISTORY.read_text(encoding="utf-8").splitlines() if ln.strip()]
+
+def _history_save(sig):
+    hist = _history_load()
+    hist.append(sig)
+    HISTORY.write_text("\n".join(hist[-200:]), encoding="utf-8")
+
 def make_script_longform():
-    """Hook → Discovery(2) → Escalation(2) → Revelation(2) → Tag"""
+    """
+    Dinamik şablonlar + mutasyon + sıra karması.
+    Çıkan satırların hash'i history ile karşılaştırılır; çakışırsa yeniden üretilir.
+    Dönen:
+      - full (kısa kullanım için)
+      - caps (sahne başlıkları dizisi)
+    """
     bank = load_seeds()
-    pick = lambda n: random.sample(bank, min(n, len(bank)))
-    hook = random.choice(HOOKS)
-    discovery = pick(2); escalation = pick(2); revelation = pick(2)
-    tag = random.choice([
-        "God is not gone. He’s buried.",
-        "The Pulse counts backwards.",
-        "No maps survived the light.",
-        "Silence replied in numbers.",
-        "The archive listens back."
-    ])
-    pieces = [hook] + discovery + escalation + revelation + [tag]
-    caps = [hook] + [s if len(s) <= 90 else s[:87]+"…" for s in (discovery+escalation+revelation)] + [tag]
-    full = " ".join(" ".join(pieces).split())
+    rng = random.Random(uuid.uuid4().int)  # her koşuda farklı
+
+    TEMPLATES = [
+        "{hook} {a}. {b}. {c}. {tag}",
+        "{hook} {a}. {b}. {c}. {d}. {tag}",
+        "{hook} {a}. Then {b}. {c}. {tag}",
+        "{hook} {a}. {b}. We listened. {c}. {tag}",
+    ]
+
+    # İçerik havuzu—mutasyon + karmayla
+    base = rng.sample(bank, min(len(bank), 12))
+    pool = [mutate_line(s) for s in base]
+    rng.shuffle(pool)
+
+    def build_once():
+        hook = rng.choice(HOOKS)
+        picks = pool[: rng.randint(6, 9)]
+        rng.shuffle(picks)
+        # kısa sahne başlıkları (caps)
+        caps = [hook] + [p[:90] + ("…" if len(p) > 90 else "") for p in picks[:6]] + [rng.choice([
+            "God is not gone. He's buried.",
+            "The Pulse counts backwards.",
+            "Silence replied in numbers.",
+            "The archive listens back."
+        ])]
+        # full metin
+        tpl = rng.choice(TEMPLATES)
+        def take_or_blank(i): return picks[i] if i < len(picks) else ""
+        full = tpl.format(
+            hook=hook, a=take_or_blank(0), b=take_or_blank(1),
+            c=take_or_blank(2), d=take_or_blank(3),
+            tag=caps[-1]
+        )
+        full = re.sub(r"\s+", " ", full).strip()
+        sig = _hash_signature(caps)
+        return full, caps, sig
+
+    history = set(_history_load())
+    for _ in range(6):
+        full, caps, sig = build_once()
+        if sig not in history:
+            _history_save(sig)
+            return full, caps
+    _history_save(sig)
     return full, caps
 
 # ============== KEYWORDING ==============
@@ -175,27 +238,79 @@ def tts_chunks_and_concatenate(lines):
     mix.export(out_path, format="mp3")
     return out_path, durations, chunk_paths
 
-# ============== CAPTION PNG ==============
-def caption_png(text: str, width=900, padding=26):
-    wrapped = textwrap.fill(text, 28)
-    try:
-        font = ImageFont.truetype("DejaVuSans.ttf", 54)
-    except Exception:
-        font = ImageFont.load_default()
-    dummy = Image.new("RGBA", (width, 10), (0,0,0,0))
-    d = ImageDraw.Draw(dummy)
-    bbox = d.multiline_textbbox((0, 0), wrapped, font=font, align="center", spacing=6)
-    w, h = bbox[2]-bbox[0], bbox[3]-bbox[1]
-    img = Image.new("RGBA", (width+2*padding, h+2*padding), (0,0,0,0))
-    # shadow
-    sd = ImageDraw.Draw(img)
-    for ox, oy in ((1,1),(2,2),(-1,1),(1,-1),(-2,-2)):
-        sd.multiline_text((img.width//2+ox, padding+oy), wrapped, font=font, fill=(0,0,0,160),
-                          align="center", anchor="ma", spacing=6)
-    # white
-    d2 = ImageDraw.Draw(img)
-    d2.multiline_text((img.width//2, padding), wrapped, font=font, fill=(255,255,255,255),
-                      align="center", anchor="ma", spacing=6)
+# ============== CAPTION PNG (auto-fit) ==============
+def caption_png(text: str, screen_w=TARGET_W, screen_h=TARGET_H, max_w_ratio=0.86, max_h_ratio=0.55):
+    padding = 28
+    max_w = int(screen_w * max_w_ratio)
+    max_h = int(screen_h * max_h_ratio)
+    try_order = [64, 60, 56, 52, 48, 44, 40, 36, 32]
+
+    base_font = "DejaVuSans.ttf"
+
+    def render_try(font_px):
+        try:
+            font = ImageFont.truetype(base_font, font_px)
+        except Exception:
+            font = ImageFont.load_default()
+
+        # Dinamik satır kırma
+        words = text.split()
+        lines, current = [], []
+        dummy = Image.new("RGBA", (max_w, 10), (0, 0, 0, 0))
+        d = ImageDraw.Draw(dummy)
+
+        for w in words:
+            test = (" ".join(current + [w])).strip()
+            bbox = d.multiline_textbbox((0, 0), test, font=font)
+            if (bbox[2] - bbox[0]) <= max_w:
+                current.append(w)
+            else:
+                if current:
+                    lines.append(" ".join(current))
+                    current = [w]
+                else:
+                    lines.append(w)
+                    current = []
+        if current:
+            lines.append(" ".join(current))
+
+        text_h = 0
+        line_metrics = []
+        for ln in lines:
+            bb = d.multiline_textbbox((0, 0), ln, font=font)
+            lw, lh = bb[2] - bb[0], bb[3] - bb[1]
+            line_metrics.append((ln, lw, lh))
+            text_h += lh
+
+        img_w = min(max_w, max((m[1] for m in line_metrics), default=0)) + 2 * padding
+        img_h = text_h + 2 * padding + (6 * max(0, len(lines) - 1))
+
+        fits = (img_w <= max_w + 2 * padding) and (img_h <= max_h + 2 * padding)
+        return fits, font, line_metrics, img_w, img_h
+
+    chosen = None
+    for px in try_order:
+        fits, font, lines, img_w, img_h = render_try(px)
+        if fits:
+            chosen = (px, font, lines, img_w, img_h)
+            break
+    if not chosen:
+        px, font, lines, img_w, img_h = render_try(try_order[-1])
+    else:
+        px, font, lines, img_w, img_h = chosen
+
+    img = Image.new("RGBA", (img_w, img_h), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    total_text_h = sum(lh for _, _, lh in lines) + (6 * max(0, len(lines) - 1))
+    y = (img_h - total_text_h) // 2
+
+    for ln, lw, lh in lines:
+        x = (img_w - lw) // 2
+        for ox, oy in ((1, 1), (2, 2), (-1, 1), (1, -1), (-2, -2)):
+            d.text((x + ox, y + oy), ln, font=font, fill=(0, 0, 0, 160))
+        d.text((x, y), ln, font=font, fill=(255, 255, 255, 255))
+        y += lh + 6
+
     out = str(OUT / f"cap_{uuid.uuid4().hex[:6]}.png")
     img.save(out)
     return out
@@ -232,7 +347,8 @@ def fetch_one_image(query: str, w=TARGET_W, timeout=10):
             if url and url.lower().endswith((".jpg", ".jpeg", ".png")):
                 raw = requests.get(url, headers=HTTP_HEADERS, timeout=timeout)
                 raw.raise_for_status()
-                name = f"{uuid.uuid4().hex[:8]}_{re.sub(r'[^a-zA-Z0-9_]+','_', query)}.jpg"
+                safe = re.sub(r"[^a-zA-Z0-9_]+", "_", query)
+                name = f"{uuid.uuid4().hex[:8]}_{safe}.jpg"
                 path = SCENE_ASSETS / name
                 path.write_bytes(raw.content)
                 print(f"[image] fetched: {query} -> {name}")
@@ -310,7 +426,7 @@ def animated_fallback_bg(duration: float):
     return VideoClip(make_frame, duration=duration)
 
 def scene_from_images(img_paths, dur: float):
-    xfade = min(0.6, max(0.8, dur/2.0) * 0.4)
+    xfade = 0.6
     bg = animated_fallback_bg(dur).set_start(0)
 
     if not img_paths:
@@ -354,14 +470,6 @@ def upload_to_youtube(path_mp4, title, desc, tags):
     return youtube.videos().insert(part=",".join(body.keys()), body=body, media_body=media).execute().get("id")
 
 # ============== ORCHESTRATOR ==============
-DYNAMIC_TITLES = [
-    "SIGNAL ARCHIVE — Whisper Archive",
-    "SIGNAL ARCHIVE — The Pulse Beneath",
-    "SIGNAL ARCHIVE — Eclipsera Relay",
-    "SIGNAL ARCHIVE — Cathedrals of Static",
-    "SIGNAL ARCHIVE — Numbers that Breathe"
-]
-
 def run_pipeline():
     uid = uuid.uuid4().hex[:6]
 
@@ -389,8 +497,8 @@ def run_pipeline():
         imgs = ensure_scene_images_for_line(cap, need=2)
         base = scene_from_images(imgs, dur).set_start(t_cursor)
 
-        cap_img = caption_png(cap, width=900)
-        cap_clip = ImageClip(cap_img).set_duration(dur).set_start(t_cursor).set_position(("center","center"))
+        cap_img = caption_png(cap, screen_w=TARGET_W, screen_h=TARGET_H, max_w_ratio=0.86, max_h_ratio=0.55)
+        cap_clip = ImageClip(cap_img).set_duration(dur).set_start(t_cursor).set_position(("center", "center"))
 
         all_scene_clips += [base, cap_clip]
         t_cursor += dur
@@ -411,8 +519,8 @@ def run_pipeline():
     # 6) Seed evrimi
     evolve_and_store(caps)
 
-    # 7) YouTube (tarih yok; her koşuda değişken)
-    title = random.choice(DYNAMIC_TITLES)
+    # 7) YouTube (tarih yok; her koşuda değişken başlık)
+    title = "SIGNAL ARCHIVE — " + random.choice(TITLE_ADJ) + " " + random.choice(TITLE_CORE)
 
     lead_options = [
         "Recovered long-range transmission.",
@@ -427,10 +535,11 @@ def run_pipeline():
         "Automated longform transmission."
     )
 
-    tags = ["godfinders","ai","cosmic horror","existential","longform","eclipsera","signal"]
+    tags = ["godfinders", "ai", "cosmic horror", "existential", "longform", "eclipsera", "signal"]
 
     vid = upload_to_youtube(mp4, title, desc, tags)
     print("Uploaded video ID:", vid)
+
 
 if __name__ == "__main__":
     run_pipeline()
