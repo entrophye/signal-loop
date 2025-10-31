@@ -1,11 +1,12 @@
 """
 AUTOYUSON — Factual Shorts (History / Space / Culture) for Yusonvasya
-- Wikipedia'dan doğrulanabilir özet + kaynak URL
-- gTTS ile seslendirme
-- PIL ile metin (başlık + altyazı) PNG; ImageMagick KULLANILMAZ
-- MoviePy ile 1080x1920 video (Shorts)
-- YouTube'a yükleme (Education=27), başlıkta tarih YOK
-- Konu tekrarını data/seen_topics.json ile azaltır, yüzlerce video için uygundur
+
+Yenilikler:
+- Edge-TTS (Neural) ile doğal ses (fallback: gTTS)
+- Cümle bazlı altyazı + süre paylaştırma (word-proportional timing)
+- İlgili birden fazla wiki görseli (Ken Burns + crossfade)
+- ImageMagick YOK; metin PNG'leri PIL ile
+- Tekrarsız konu takibi (data/seen_topics.json)
 
 ENV (GitHub Secrets veya local env):
   # Birincil yol:
@@ -13,24 +14,26 @@ ENV (GitHub Secrets veya local env):
   YT_CLIENT_SECRET
   YT_REFRESH_TOKEN
 
-  # Yedek yol (bunlar boşsa çalışır):
-  TOKEN_JSON_BASE64   # token.json içeriğinin base64 hâli (içinden refresh_token, client_id, client_secret okunur)
+  # Yedek yol:
+  TOKEN_JSON_BASE64   # token.json içeriğinin base64 hâli (içinden refresh_token/client_id/client_secret okunur)
 
-Opsiyonel ENV:
+Opsiyonel:
   LANGUAGE=en
   VIDEO_DURATION=55
   TITLE_PREFIX=
   CONTENT_THEME=FACTUAL_SHORTS
   TOPICS_FILE=topics.txt
+  EDGE_TTS_VOICE=en-US-AriaNeural  # Edge-TTS ses adı
 """
 
-import os, io, re, json, base64, random, textwrap, pathlib, sys
+import os, io, re, json, base64, random, textwrap, pathlib, sys, asyncio
 from typing import List, Tuple, Optional
 from dataclasses import dataclass
 
 import requests
 from PIL import Image, ImageDraw, ImageFont
-# Pillow 10+ uyumluluk şimi (ANTIALIAS kaldırıldıysa LANCZOS'a işaret et)
+
+# Pillow 10+ uyumluluk şimi
 try:
     _ = Image.ANTIALIAS  # type: ignore[attr-defined]
 except AttributeError:
@@ -40,7 +43,8 @@ except AttributeError:
         pass
 
 from gtts import gTTS
-from moviepy.editor import ImageClip, AudioFileClip, CompositeVideoClip, CompositeAudioClip, afx
+from moviepy.editor import (ImageClip, AudioFileClip, CompositeVideoClip,
+                            CompositeAudioClip, afx)
 from moviepy.video.fx.all import resize as mp_resize
 from googleapiclient.discovery import build
 from google.oauth2.credentials import Credentials
@@ -55,6 +59,7 @@ YOUTUBE_CATEGORY_ID = "27"
 DEFAULT_TAGS = ["history", "space", "astronomy", "archaeology", "culture", "documentary", "facts", "shorts"]
 APPEND_DATE_TO_TITLE = False
 TOPICS_FILE = os.getenv("TOPICS_FILE", "topics.txt")
+EDGE_TTS_VOICE = os.getenv("EDGE_TTS_VOICE", "en-US-AriaNeural")
 
 wikipedia.set_lang("en")
 
@@ -98,7 +103,8 @@ def pick_topic(seen: List[str]) -> str:
     return random.choice(pool)
 
 # ---------- Wikipedia ----------
-def wiki_fetch(topic: str) -> Tuple[str, str, str, Optional[str]]:
+def wiki_fetch(topic: str):
+    """Return (title, summary, url, image_urls:list)"""
     try:
         page = wikipedia.page(topic, auto_suggest=False, preload=True)
     except Exception:
@@ -108,20 +114,27 @@ def wiki_fetch(topic: str) -> Tuple[str, str, str, Optional[str]]:
     title = page.title
     summary = wikipedia.summary(title, sentences=4)
     url = page.url
-    image_url = None
+    # Çoklu görsel: filtrele
+    image_urls = []
     for img in page.images:
         low = img.lower()
-        if any(b in low for b in ["logo","icon","flag","seal","map","diagram","coat_of_arms"]): continue
+        if any(b in low for b in ["logo","icon","flag","seal","map","diagram","coat_of_arms","favicon","sprite"]):
+            continue
         if low.endswith((".jpg",".jpeg",".png")):
-            image_url = img; break
-    return title, summary, url, image_url
+            image_urls.append(img)
+    # sınırlayalım
+    image_urls = image_urls[:8] or []
+    return title, summary, url, image_urls
 
-def download_image(url: str) -> Image.Image:
-    r = requests.get(url, timeout=30); r.raise_for_status()
-    return Image.open(io.BytesIO(r.content)).convert("RGB")
+def download_image(url: str) -> Optional[Image.Image]:
+    try:
+        r = requests.get(url, timeout=30); r.raise_for_status()
+        return Image.open(io.BytesIO(r.content)).convert("RGB")
+    except Exception:
+        return None
 
 # ---------- Script ----------
-def craft_script(title: str, summary: str, sources: List[str]) -> Tuple[str, str]:
+def craft_script(title: str, summary: str, sources: List[str]) -> Tuple[str, str, List[str]]:
     txt = re.sub(r"\[\d+\]", "", summary).strip()
     txt = re.sub(r"\s+", " ", txt)
     words = txt.split()
@@ -130,22 +143,21 @@ def craft_script(title: str, summary: str, sources: List[str]) -> Tuple[str, str
     else: body = txt
     hook = f"{title}: a verified chapter of our shared past."
     takeaway = "What endures is evidence — and what it reveals."
-    narration = f"{hook}\n{body}\n{takeaway}\n\nSources:\n" + "\n".join(f"- {s}" for s in sources[:4])
-    return narration, title
+    narration = f"{hook} {body} {takeaway}"
+    # cümlelere böl (nokta, ünlem, soru işareti)
+    sentences = [s.strip() for s in re.split(r'(?<=[.!?])\s+', narration) if s.strip()]
+    return narration, title, sentences
 
 def is_factual_enough(text: str) -> bool:
-    if "sources:" not in text.lower(): return False
-    if "http" not in text.lower(): return False
     bad = ["reportedly","allegedly","some say","legend has it","it is said","rumor"]
     if any(w in text.lower() for w in bad): return False
-    n = len(text.split()); return 80 <= n <= 200
+    n = len(text.split()); return 80 <= n <= 220
 
 # ---------- Fonts ----------
 N_REG = FONTS_DIR / "NotoSans-Regular.ttf"
 N_BOLD = FONTS_DIR / "NotoSans-Bold.ttf"
 
 def ensure_fonts():
-    # Hafif, güvenli: NotoSans
     srcs = {
         N_REG: "https://github.com/googlefonts/noto-fonts/raw/main/hinted/ttf/NotoSans/NotoSans-Regular.ttf",
         N_BOLD:"https://github.com/googlefonts/noto-fonts/raw/main/hinted/ttf/NotoSans/NotoSans-Bold.ttf"
@@ -156,7 +168,7 @@ def ensure_fonts():
                 r = requests.get(url, timeout=30); r.raise_for_status()
                 path.write_bytes(r.content)
             except Exception:
-                pass  # PIL default fonta düşer
+                pass  # default font
 
 def get_font(size=48, bold=False):
     try:
@@ -168,8 +180,7 @@ def get_font(size=48, bold=False):
 def pil_text_image(text: str, width: int, fontsize: int, bold: bool=False, fill=(255,255,255), padding=8) -> Image.Image:
     font = get_font(size=fontsize, bold=bold)
     # kelime sarmalama
-    lines = []
-    cur = ""
+    lines, cur = [], ""
     draw = ImageDraw.Draw(Image.new("RGB",(10,10)))
     for word in text.split():
         test = (cur + " " + word).strip()
@@ -180,7 +191,6 @@ def pil_text_image(text: str, width: int, fontsize: int, bold: bool=False, fill=
         else:
             cur = test
     if cur: lines.append(cur)
-    # boyut
     ascent, descent = font.getmetrics()
     line_h = ascent + descent + 6
     img_h = padding*2 + line_h*len(lines)
@@ -190,7 +200,6 @@ def pil_text_image(text: str, width: int, fontsize: int, bold: bool=False, fill=
     for ln in lines:
         w,_ = draw.textsize(ln, font=font)
         x = (width - w)//2
-        # hafif siyah gölge
         draw.text((x+2, y+2), ln, font=font, fill=(0,0,0,160))
         draw.text((x, y), ln, font=font, fill=fill)
         y += line_h
@@ -200,44 +209,32 @@ def save_text_png(text: str, out_path: str, width: int, fontsize: int, bold=Fals
     img = pil_text_image(text, width=width, fontsize=fontsize, bold=bold, fill=fill)
     img.save(out_path, "PNG")
 
-def wrap_lines_for_subs(text: str, max_chars=52) -> List[str]:
-    lines = []
-    for para in text.splitlines():
-        p = para.strip()
-        if not p or p.lower().startswith("sources:"): continue
-        chunk = textwrap.fill(p, width=max_chars)
-        lines.extend([l for l in chunk.split("\n") if l.strip()])
-    return lines
+# ---------- TTS ----------
+async def edge_tts_synthesize_async(text: str, outpath: str, voice: str):
+    import edge_tts, aiofiles
+    communicator = edge_tts.Communicate(text, voice=voice)
+    async with aiofiles.open(outpath, "wb") as f:
+        async for chunk in communicator.stream():
+            if chunk["type"] == "audio":
+                await f.write(chunk["data"])
 
-# ---------- OAuth helpers ----------
-def _read_oauth_from_env_or_b64():
+def tts_to_file(text: str, outpath: str, lang: str = "en", voice: Optional[str] = None):
     """
-    Önce doğrudan env değişkenlerine bakar (YT_CLIENT_ID / SECRET / REFRESH).
-    Bunlar boşsa, TOKEN_JSON_BASE64 varsa decode edip içinden değerleri çeker.
+    Edge-TTS (neural) → gTTS fallback.
     """
-    cid = os.getenv("YT_CLIENT_ID", "").strip()
-    csecret = os.getenv("YT_CLIENT_SECRET", "").strip()
-    rtoken = os.getenv("YT_REFRESH_TOKEN", "").strip()
-
-    if cid and csecret and rtoken:
-        return cid, csecret, rtoken
-
-    b64 = os.getenv("TOKEN_JSON_BASE64", "").strip()
-    if not b64:
-        # hiçbir şey yok
-        return cid, csecret, rtoken
-
+    if voice:
+        try:
+            asyncio.get_event_loop()
+        except RuntimeError:
+            asyncio.set_event_loop(asyncio.new_event_loop())
     try:
-        raw = base64.b64decode(b64).decode("utf-8")
-        data = json.loads(raw)
-        # token.json formatında beklenen alanlar:
-        # refresh_token, client_id, client_secret (bazı tool'larda client bilgileri ayrı dosyada olabilir)
-        rtoken2 = (data.get("refresh_token") or "").strip()
-        cid2 = (data.get("client_id") or cid).strip()
-        csecret2 = (data.get("client_secret") or csecret).strip()
-        return cid2 or cid, csecret2 or csecret, rtoken2 or rtoken
+        if voice:
+            asyncio.get_event_loop().run_until_complete(edge_tts_synthesize_async(text, outpath, voice))
+            return
     except Exception:
-        return cid, csecret, rtoken
+        pass
+    # fallback
+    gTTS(text=text, lang=lang, tld="com").save(outpath)
 
 # ---------- Render ----------
 @dataclass
@@ -258,73 +255,115 @@ def fit_center_crop(img: Image.Image, w=W, h=H) -> Image.Image:
     left = (img.width - w)//2; top = (img.height - h)//2
     return img.crop((left, top, left+w, top+h))
 
-def render_video(title: str, narration: str, bg_img: Image.Image, audio_path: str, duration_hint: int) -> RenderResult:
+def build_broll_clips(bg_images: List[Image.Image], duration: float):
+    """
+    Birden çok görsel → art arda gösterim (Ken Burns + crossfade).
+    """
+    if not bg_images:
+        bg_images = [Image.new("RGB",(W,H),(20,20,24))]
+    n = len(bg_images)
+    per = max(3.5, min(8.0, duration / n))
+    clips = []
+    for i, im in enumerate(bg_images):
+        im_fit = fit_center_crop(im)
+        path = f"bg_{i:02d}.jpg"
+        im_fit.save(path, quality=92)
+        clip = ImageClip(path).set_duration(per).fx(mp_resize, 1.06)
+        clips.append(clip)
+    # crossfade ile birleştirme
+    # moviepy concatenate_videoclips yerine CompositeVideoClip ile hafif bindirmeler
+    t = 0.0
+    layers = []
+    for i, c in enumerate(clips):
+        d = c.duration
+        fc = 0.5  # fade süresi
+        layers.append(c.set_start(t).crossfadein(fc).crossfadeout(fc))
+        t += d - fc  # bindirme
+    base_dur = duration
+    return CompositeVideoClip(layers).set_duration(base_dur)
+
+def split_sentences_for_subs(sentences: List[str], audio_duration: float) -> List[Tuple[str, float]]:
+    """
+    Cümleleri, toplam ses süresine kelime sayısına göre orantılı dağıt.
+    Return: [(line, dur_s), ...]
+    """
+    toks = [len(re.findall(r"\w+", s)) or 1 for s in sentences]
+    total = sum(toks) or 1
+    base = max(0.8, audio_duration * 0.92)  # küçük pay
+    return [(sentences[i], max(1.6, base * (toks[i] / total))) for i in range(len(sentences))]
+
+def render_video(title: str, narration: str, sentences: List[str],
+                 bg_images: List[Image.Image], audio_path: str, duration_hint: int) -> RenderResult:
     ensure_fonts()
-    bg = fit_center_crop(bg_img)
-    bg_path = "bg_autoyuson.jpg"; bg.save(bg_path, quality=92)
 
     narration_audio = AudioFileClip(audio_path)
-    duration = max(min(max(duration_hint, 40), 75), narration_audio.duration + 1.0)
+    duration = max(min(max(duration_hint, 40), 75), narration_audio.duration + 0.8)
 
-    bg_clip = ImageClip(bg_path).set_duration(duration).fx(mp_resize, 1.06)
+    # Çoklu görsel b-roll kompoziti
+    broll = build_broll_clips(bg_images, duration)
 
-    # Title (PNG, üstte kısa)
+    # Title (PNG)
     title_png = "title.png"
     save_text_png(title[:64], title_png, width=W-140, fontsize=72, bold=True)
     title_clip = ImageClip(title_png).set_duration(4.0).set_position(("center", 80)).fadein(0.3).fadeout(0.3)
 
-    # Subtitles (PNGs)
+    # Subtitles (cümle bazlı, süre orantılı)
+    per_lines = split_sentences_for_subs(sentences, narration_audio.duration)
     subs = []
-    sub_lines = wrap_lines_for_subs(narration, max_chars=46)
-    per_line = max(2.0, min(4.0, duration / max(8, len(sub_lines) or 8)))
-    t = 1.0
-    for line in sub_lines:
-        fn = f"sub_{len(subs):03d}.png"
+    cur_t = 0.8
+    for i, (line, dur) in enumerate(per_lines):
+        fn = f"sub_{i:03d}.png"
         save_text_png(line, fn, width=W-160, fontsize=50, bold=False)
-        clip = ImageClip(fn).set_start(t).set_duration(per_line).set_position(("center", H-420)).fadein(0.15).fadeout(0.15)
+        clip = ImageClip(fn).set_start(cur_t).set_duration(dur).set_position(("center", H-420)).fadein(0.15).fadeout(0.15)
         subs.append(clip)
-        t += per_line * 0.9
+        cur_t += dur * 0.98  # küçük bindirme ile akış hissi
 
     narration_audio = narration_audio.fx(afx.audio_normalize)
     comp_audio = CompositeAudioClip([narration_audio.set_start(0)])
-    comp = CompositeVideoClip([bg_clip, title_clip, *subs]).set_audio(comp_audio).set_duration(duration)
+    comp = CompositeVideoClip([broll, title_clip, *subs]).set_audio(comp_audio).set_duration(duration)
 
     out_name = re.sub(r"[^-\w\s.,()]+","",title).strip().replace(" ","_")[:80] or "autoyuson_video"
     out_path = f"{out_name}.mp4"
     comp.write_videofile(out_path, fps=30, codec="libx264", audio_codec="aac",
                          temp_audiofile="temp-audio.m4a", remove_temp=True, threads=4, verbose=False, logger=None)
 
-    # Description (sources)
-    sources_block = []
-    capture = False
-    for line in narration.splitlines():
-        if line.strip().lower().startswith("sources:"):
-            capture = True; continue
-        if capture and line.strip().startswith("-"):
-            sources_block.append(line.strip()[2:])
+    # Description (kaynak)
     description = (f"{title}\n\nShort factual video. No speculation, no fiction.\n\n"
-                   f"Sources:\n" + "\n".join(f"- {s}" for s in sources_block[:6]) +
+                   f"Source:\n- Wikipedia: https://en.wikipedia.org/wiki/{title.replace(' ','_')}"
                    "\n\n#history #space #culture #facts #shorts")
-
     return RenderResult(video_path=out_path, title=title, description=description, tags=DEFAULT_TAGS)
 
-# ---------- YouTube ----------
+# ---------- OAuth helpers ----------
+def _read_oauth_from_env_or_b64():
+    cid = os.getenv("YT_CLIENT_ID", "").strip()
+    csecret = os.getenv("YT_CLIENT_SECRET", "").strip()
+    rtoken = os.getenv("YT_REFRESH_TOKEN", "").strip()
+    if cid and csecret and rtoken:
+        return cid, csecret, rtoken
+    b64 = os.getenv("TOKEN_JSON_BASE64", "").strip()
+    if not b64:
+        return cid, csecret, rtoken
+    try:
+        raw = base64.b64decode(b64).decode("utf-8")
+        data = json.loads(raw)
+        rtoken2 = (data.get("refresh_token") or "").strip()
+        cid2 = (data.get("client_id") or cid).strip()
+        csecret2 = (data.get("client_secret") or csecret).strip()
+        return cid2 or cid, csecret2 or csecret, rtoken2 or rtoken
+    except Exception:
+        return cid, csecret, rtoken
+
 def build_youtube_service():
-    # Secrets veya base64 token.json'dan oku
     client_id, client_secret, refresh_token = _read_oauth_from_env_or_b64()
     if not refresh_token:
         raise RuntimeError("Missing refresh_token. Set YT_REFRESH_TOKEN or TOKEN_JSON_BASE64.")
-
-    # client_id / client_secret bazı durumlarda base64 token.json'da yok olabilir
     if not client_id or not client_secret:
-        # Yoksa yine de deneyelim; çoğu projede lazım.
         cid_env = os.getenv("YT_CLIENT_ID", "").strip()
         cs_env  = os.getenv("YT_CLIENT_SECRET", "").strip()
         client_id = client_id or cid_env
         client_secret = client_secret or cs_env
         if not client_id or not client_secret:
-            raise RuntimeError("Missing client_id/client_secret. Provide YT_CLIENT_ID / YT_CLIENT_SECRET or include them in TOKEN_JSON_BASE64.")
-
+            raise RuntimeError("Missing client_id/client_secret.")
     creds = Credentials(token=None, refresh_token=refresh_token,
                         token_uri="https://oauth2.googleapis.com/token",
                         client_id=client_id, client_secret=client_secret,
@@ -347,33 +386,34 @@ def youtube_upload(video_path: str, title: str, description: str, tags: List[str
     return resp.get("id","")
 
 # ---------- Orchestrator ----------
-def tts_to_file(text: str, outpath: str, lang: str = "en"):
-    gTTS(text=text, lang=lang, tld="com").save(outpath)
-
 def main() -> int:
     seen = load_seen()
     topic = pick_topic(seen)
     print(f"[AUTOYUSON] Topic: {topic}")
 
-    title, summary, url, img_url = wiki_fetch(topic)
+    title, summary, url, image_urls = wiki_fetch(topic)
     sources = [url]
-    narration, short_title = craft_script(title, summary, sources)
+    narration, short_title, sentences = craft_script(title, summary, sources)
     if not is_factual_enough(narration):
         summary2 = wikipedia.summary(title, sentences=5)
-        narration, short_title = craft_script(title, summary2, sources)
+        narration, short_title, sentences = craft_script(title, summary2, sources)
 
-    # Background image
-    if img_url:
-        try: img = download_image(img_url)
-        except Exception: img = Image.new("RGB",(W,H),(20,20,24))
-    else:
-        img = Image.new("RGB",(W,H),(20,20,24))
+    # Görselleri indir
+    bg_images: List[Image.Image] = []
+    for u in image_urls:
+        im = download_image(u)
+        if im: bg_images.append(im)
+    if not bg_images:
+        bg_images = [Image.new("RGB",(W,H),(20,20,24))]
 
+    # TTS (Edge-TTS → gTTS fallback)
     audio_path = "narration_autoyuson.mp3"
-    tts_to_file(narration, audio_path, LANG)
+    tts_to_file(narration, audio_path, LANG, voice=EDGE_TTS_VOICE)
 
-    result = render_video(short_title, narration, img, audio_path, DURATION_TARGET)
+    # Render
+    result = render_video(short_title, narration, sentences, bg_images, audio_path, DURATION_TARGET)
 
+    # Upload
     print("[AUTOYUSON] Uploading...")
     vid = youtube_upload(result.video_path, result.title, result.description, result.tags)
     print(f"[AUTOYUSON] Uploaded: https://youtube.com/watch?v={vid}")
