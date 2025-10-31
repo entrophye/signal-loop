@@ -3,7 +3,7 @@ name: Autoyuson — Factual Shorts
 on:
   workflow_dispatch:
   schedule:
-    - cron: "17 13 * * *"
+    - cron: "17 13 * * *"  # her gün 16:17 (+03)
 
 permissions:
   contents: write
@@ -27,7 +27,6 @@ jobs:
           sudo apt-get update -y
           sudo apt-get install -y ffmpeg
 
-      # 🔧 Tüm pip çağrılarını *aynı* Python'a yapıyoruz ve sürümleri sabitliyoruz
       - name: Install Python dependencies (pinned)
         run: |
           python -V
@@ -35,14 +34,16 @@ jobs:
           python -m pip install --no-cache-dir numpy==1.26.4
           python -m pip install --no-cache-dir imageio==2.31.1 imageio-ffmpeg==0.4.8
           python -m pip install --no-cache-dir moviepy==1.0.3
-          python -m pip install --no-cache-dir gTTS pillow requests wikipedia \
+          # Pillow 9.5.0: ANTIALIAS sabit, MoviePy ile uyumlu
+          python -m pip install --no-cache-dir pillow==9.5.0
+          python -m pip install --no-cache-dir gTTS requests wikipedia \
             google-api-python-client google-auth-httplib2 google-auth-oauthlib
-          # ✅ Doğru doğrulama
+          # Doğrulama
           python - << 'PY'
           import sys, moviepy, imageio, numpy
           import moviepy.editor as m
           print("Python:", sys.version)
-          print("moviepy:", moviepy.__version__)
+          print("moviepy:", getattr(moviepy, "__version__", "unknown"))
           print("imageio:", imageio.__version__)
           print("numpy:", numpy.__version__)
           print("editor OK:", hasattr(m, "VideoFileClip"))
