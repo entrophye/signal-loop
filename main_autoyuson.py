@@ -1,12 +1,16 @@
 """
 AUTOYUSON — Factual Shorts (History / Space / Culture) for Yusonvasya
 
-Yenilikler:
-- Edge-TTS (Neural) ile doğal ses (fallback: gTTS)
-- Cümle bazlı altyazı + süre paylaştırma (word-proportional timing)
-- İlgili birden fazla wiki görseli (Ken Burns + crossfade)
-- ImageMagick YOK; metin PNG'leri PIL ile
-- Tekrarsız konu takibi (data/seen_topics.json)
+Güncellemeler:
+- python-wikipedia kaldırıldı. Doğrudan Wikipedia REST + Media API kullanımı:
+  • /api/rest_v1/page/summary/{title}
+  • /api/rest_v1/page/media/{title}
+  • /w/api.php?action=opensearch ... (fallback arama)
+- Konu adı bozuk gelse bile OpenSearch ile en iyi eşleşme bulunur.
+- Edge-TTS (Neural) ses, gTTS fallback.
+- Cümle bazlı altyazı + süre orantılama.
+- Çoklu görsel (Ken Burns + crossfade).
+- ImageMagick yok; tüm metinler PIL ile PNG.
 
 ENV (GitHub Secrets veya local env):
   # Birincil yol:
@@ -14,8 +18,8 @@ ENV (GitHub Secrets veya local env):
   YT_CLIENT_SECRET
   YT_REFRESH_TOKEN
 
-  # Yedek yol:
-  TOKEN_JSON_BASE64   # token.json içeriğinin base64 hâli (içinden refresh_token/client_id/client_secret okunur)
+  # Yedek yol (bunlar boşsa çalışır):
+  TOKEN_JSON_BASE64   # token.json içeriğinin base64 hâli (refresh_token + client_id + client_secret)
 
 Opsiyonel:
   LANGUAGE=en
@@ -23,10 +27,10 @@ Opsiyonel:
   TITLE_PREFIX=
   CONTENT_THEME=FACTUAL_SHORTS
   TOPICS_FILE=topics.txt
-  EDGE_TTS_VOICE=en-US-AriaNeural  # Edge-TTS ses adı
+  EDGE_TTS_VOICE=en-US-AriaNeural
 """
 
-import os, io, re, json, base64, random, textwrap, pathlib, sys, asyncio
+import os, io, re, json, base64, random, textwrap, pathlib, sys, asyncio, urllib.parse
 from typing import List, Tuple, Optional
 from dataclasses import dataclass
 
@@ -49,7 +53,6 @@ from moviepy.video.fx.all import resize as mp_resize
 from googleapiclient.discovery import build
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
-import wikipedia
 
 # ---------- Config ----------
 LANG = os.getenv("LANGUAGE", "en").strip() or "en"
@@ -61,7 +64,15 @@ APPEND_DATE_TO_TITLE = False
 TOPICS_FILE = os.getenv("TOPICS_FILE", "topics.txt")
 EDGE_TTS_VOICE = os.getenv("EDGE_TTS_VOICE", "en-US-AriaNeural")
 
-wikipedia.set_lang("en")
+DATA_DIR = pathlib.Path("data"); DATA_DIR.mkdir(parents=True, exist_ok=True)
+SEEN_PATH = DATA_DIR / "seen_topics.json"
+FONTS_DIR = pathlib.Path("fonts"); FONTS_DIR.mkdir(exist_ok=True)
+
+W, H = 1080, 1920
+WIKI = "https://en.wikipedia.org"
+REST = f"{WIKI}/api/rest_v1"
+API  = f"{WIKI}/w/api.php"
+UA = {"User-Agent": "autoyuson-bot/1.0 (https://github.com/)"}  # nazik olalım
 
 CURATED_TOPICS = [
     "Rosetta Stone","Dead Sea Scrolls","Hagia Sophia","Voyager Golden Record","Terracotta Army","Göbekli Tepe",
@@ -70,12 +81,6 @@ CURATED_TOPICS = [
     "Arecibo message","Cassini–Huygens","Venera 13","Voyager 1","Chandrasekhar limit","Nazca Lines",
     "Antikythera mechanism","I Ching","Shahnameh","Silk Road","Machu Picchu","Moai","Çatalhöyük"
 ]
-
-DATA_DIR = pathlib.Path("data"); DATA_DIR.mkdir(parents=True, exist_ok=True)
-SEEN_PATH = DATA_DIR / "seen_topics.json"
-FONTS_DIR = pathlib.Path("fonts"); FONTS_DIR.mkdir(exist_ok=True)
-
-W, H = 1080, 1920
 
 # ---------- Seen topics ----------
 def load_seen() -> List[str]:
@@ -102,41 +107,93 @@ def pick_topic(seen: List[str]) -> str:
             return t
     return random.choice(pool)
 
-# ---------- Wikipedia ----------
+# ---------- Wikipedia (REST) ----------
+def _rest_summary(title: str):
+    url = f"{REST}/page/summary/{urllib.parse.quote(title)}"
+    r = requests.get(url, headers=UA, timeout=20)
+    if r.status_code != 200:
+        return None
+    return r.json()
+
+def _rest_media(title: str):
+    url = f"{REST}/page/media/{urllib.parse.quote(title)}"
+    r = requests.get(url, headers=UA, timeout=20)
+    if r.status_code != 200:
+        return None
+    return r.json()
+
+def _opensearch(q: str) -> List[str]:
+    r = requests.get(API, headers=UA, timeout=20, params={
+        "action": "opensearch",
+        "search": q,
+        "limit": 5,
+        "namespace": 0,
+        "format": "json"
+    })
+    if r.status_code != 200:
+        return []
+    data = r.json()
+    return data[1] if isinstance(data, list) and len(data) >= 2 else []
+
 def wiki_fetch(topic: str):
-    """Return (title, summary, url, image_urls:list)"""
-    try:
-        page = wikipedia.page(topic, auto_suggest=False, preload=True)
-    except Exception:
-        hits = wikipedia.search(topic)
-        if not hits: raise RuntimeError("No wiki results")
-        page = wikipedia.page(hits[0], auto_suggest=True, preload=True)
-    title = page.title
-    summary = wikipedia.summary(title, sentences=4)
-    url = page.url
-    # Çoklu görsel: filtrele
-    image_urls = []
-    for img in page.images:
-        low = img.lower()
-        if any(b in low for b in ["logo","icon","flag","seal","map","diagram","coat_of_arms","favicon","sprite"]):
-            continue
-        if low.endswith((".jpg",".jpeg",".png")):
-            image_urls.append(img)
-    # sınırlayalım
-    image_urls = image_urls[:8] or []
-    return title, summary, url, image_urls
+    """
+    Robust: önce summary dener, 404 olursa opensearch ile en iyi başlığı bulur,
+    tekrar summary + media çağırır.
+
+    Return: (title, summary, page_url, image_urls:list)
+    """
+    cand_titles = [topic] + _opensearch(topic)
+    for cand in cand_titles:
+        s = _rest_summary(cand)
+        if not s: continue
+        # summary & url
+        title = s.get("title") or cand
+        extract = s.get("extract") or ""
+        page_url = s.get("content_urls", {}).get("desktop", {}).get("page") or f"{WIKI}/wiki/{urllib.parse.quote(title.replace(' ','_'))}"
+        # media
+        imgs: List[str] = []
+        m = _rest_media(title)
+        if m and "items" in m:
+            for it in m["items"]:
+                # Type "image" olanlar
+                if it.get("type") != "image":
+                    continue
+                # source / original
+                src = None
+                if "srcset" in it and it["srcset"]:
+                    # en büyük boyu al
+                    src = sorted(it["srcset"], key=lambda x: x.get("scale", 1.0))[-1].get("src")
+                if not src:
+                    src = it.get("src")
+                if not src:
+                    continue
+                low = str(src).lower()
+                if any(b in low for b in ["logo","icon","flag","seal","map","diagram","coat_of_arms","favicon","sprite"]):
+                    continue
+                if not low.endswith((".jpg",".jpeg",".png",".webp")):
+                    continue
+                imgs.append(src)
+        # fallback: summary thumb
+        thumb = s.get("thumbnail", {}).get("source")
+        if thumb:
+            imgs = [thumb] + imgs
+        if extract:
+            # başarı
+            return title, extract, page_url, imgs[:8]
+    # hiçbir şey bulunamazsa hata
+    raise RuntimeError(f"Wiki fetch failed for topic: {topic}")
 
 def download_image(url: str) -> Optional[Image.Image]:
     try:
-        r = requests.get(url, timeout=30); r.raise_for_status()
-        return Image.open(io.BytesIO(r.content)).convert("RGB")
+        r = requests.get(url, headers=UA, timeout=30); r.raise_for_status()
+        img = Image.open(io.BytesIO(r.content)).convert("RGB")
+        return img
     except Exception:
         return None
 
 # ---------- Script ----------
-def craft_script(title: str, summary: str, sources: List[str]) -> Tuple[str, str, List[str]]:
-    txt = re.sub(r"\[\d+\]", "", summary).strip()
-    txt = re.sub(r"\s+", " ", txt)
+def craft_script(title: str, summary: str, page_url: str) -> Tuple[str, str, List[str]]:
+    txt = re.sub(r"\s+", " ", summary).strip()
     words = txt.split()
     if len(words) > 120: body = " ".join(words[:120])
     elif len(words) < 80: body = txt + " " + " ".join((words+words)[:80])
@@ -144,14 +201,14 @@ def craft_script(title: str, summary: str, sources: List[str]) -> Tuple[str, str
     hook = f"{title}: a verified chapter of our shared past."
     takeaway = "What endures is evidence — and what it reveals."
     narration = f"{hook} {body} {takeaway}"
-    # cümlelere böl (nokta, ünlem, soru işareti)
+    # cümlelere böl
     sentences = [s.strip() for s in re.split(r'(?<=[.!?])\s+', narration) if s.strip()]
     return narration, title, sentences
 
 def is_factual_enough(text: str) -> bool:
     bad = ["reportedly","allegedly","some say","legend has it","it is said","rumor"]
     if any(w in text.lower() for w in bad): return False
-    n = len(text.split()); return 80 <= n <= 220
+    n = len(text.split()); return 80 <= n <= 240
 
 # ---------- Fonts ----------
 N_REG = FONTS_DIR / "NotoSans-Regular.ttf"
@@ -165,7 +222,7 @@ def ensure_fonts():
     for path, url in srcs.items():
         if not path.exists():
             try:
-                r = requests.get(url, timeout=30); r.raise_for_status()
+                r = requests.get(url, headers=UA, timeout=30); r.raise_for_status()
                 path.write_bytes(r.content)
             except Exception:
                 pass  # default font
@@ -179,7 +236,6 @@ def get_font(size=48, bold=False):
 # ---------- Text to PNG ----------
 def pil_text_image(text: str, width: int, fontsize: int, bold: bool=False, fill=(255,255,255), padding=8) -> Image.Image:
     font = get_font(size=fontsize, bold=bold)
-    # kelime sarmalama
     lines, cur = [], ""
     draw = ImageDraw.Draw(Image.new("RGB",(10,10)))
     for word in text.split():
@@ -219,16 +275,12 @@ async def edge_tts_synthesize_async(text: str, outpath: str, voice: str):
                 await f.write(chunk["data"])
 
 def tts_to_file(text: str, outpath: str, lang: str = "en", voice: Optional[str] = None):
-    """
-    Edge-TTS (neural) → gTTS fallback.
-    """
-    if voice:
-        try:
-            asyncio.get_event_loop()
-        except RuntimeError:
-            asyncio.set_event_loop(asyncio.new_event_loop())
     try:
         if voice:
+            try:
+                asyncio.get_event_loop()
+            except RuntimeError:
+                asyncio.set_event_loop(asyncio.new_event_loop())
             asyncio.get_event_loop().run_until_complete(edge_tts_synthesize_async(text, outpath, voice))
             return
     except Exception:
@@ -256,13 +308,10 @@ def fit_center_crop(img: Image.Image, w=W, h=H) -> Image.Image:
     return img.crop((left, top, left+w, top+h))
 
 def build_broll_clips(bg_images: List[Image.Image], duration: float):
-    """
-    Birden çok görsel → art arda gösterim (Ken Burns + crossfade).
-    """
     if not bg_images:
         bg_images = [Image.new("RGB",(W,H),(20,20,24))]
     n = len(bg_images)
-    per = max(3.5, min(8.0, duration / n))
+    per = max(3.5, min(8.0, duration / max(1, n)))
     clips = []
     for i, im in enumerate(bg_images):
         im_fit = fit_center_crop(im)
@@ -270,26 +319,20 @@ def build_broll_clips(bg_images: List[Image.Image], duration: float):
         im_fit.save(path, quality=92)
         clip = ImageClip(path).set_duration(per).fx(mp_resize, 1.06)
         clips.append(clip)
-    # crossfade ile birleştirme
-    # moviepy concatenate_videoclips yerine CompositeVideoClip ile hafif bindirmeler
+    # crossfade bindirmeli katman
     t = 0.0
     layers = []
     for i, c in enumerate(clips):
         d = c.duration
-        fc = 0.5  # fade süresi
+        fc = 0.5
         layers.append(c.set_start(t).crossfadein(fc).crossfadeout(fc))
-        t += d - fc  # bindirme
-    base_dur = duration
-    return CompositeVideoClip(layers).set_duration(base_dur)
+        t += d - fc
+    return CompositeVideoClip(layers).set_duration(duration)
 
 def split_sentences_for_subs(sentences: List[str], audio_duration: float) -> List[Tuple[str, float]]:
-    """
-    Cümleleri, toplam ses süresine kelime sayısına göre orantılı dağıt.
-    Return: [(line, dur_s), ...]
-    """
     toks = [len(re.findall(r"\w+", s)) or 1 for s in sentences]
     total = sum(toks) or 1
-    base = max(0.8, audio_duration * 0.92)  # küçük pay
+    base = max(0.8, audio_duration * 0.92)
     return [(sentences[i], max(1.6, base * (toks[i] / total))) for i in range(len(sentences))]
 
 def render_video(title: str, narration: str, sentences: List[str],
@@ -299,15 +342,14 @@ def render_video(title: str, narration: str, sentences: List[str],
     narration_audio = AudioFileClip(audio_path)
     duration = max(min(max(duration_hint, 40), 75), narration_audio.duration + 0.8)
 
-    # Çoklu görsel b-roll kompoziti
     broll = build_broll_clips(bg_images, duration)
 
-    # Title (PNG)
+    # Title
     title_png = "title.png"
     save_text_png(title[:64], title_png, width=W-140, fontsize=72, bold=True)
     title_clip = ImageClip(title_png).set_duration(4.0).set_position(("center", 80)).fadein(0.3).fadeout(0.3)
 
-    # Subtitles (cümle bazlı, süre orantılı)
+    # Subtitles (cümle bazlı)
     per_lines = split_sentences_for_subs(sentences, narration_audio.duration)
     subs = []
     cur_t = 0.8
@@ -316,7 +358,7 @@ def render_video(title: str, narration: str, sentences: List[str],
         save_text_png(line, fn, width=W-160, fontsize=50, bold=False)
         clip = ImageClip(fn).set_start(cur_t).set_duration(dur).set_position(("center", H-420)).fadein(0.15).fadeout(0.15)
         subs.append(clip)
-        cur_t += dur * 0.98  # küçük bindirme ile akış hissi
+        cur_t += dur * 0.98
 
     narration_audio = narration_audio.fx(afx.audio_normalize)
     comp_audio = CompositeAudioClip([narration_audio.set_start(0)])
@@ -327,9 +369,10 @@ def render_video(title: str, narration: str, sentences: List[str],
     comp.write_videofile(out_path, fps=30, codec="libx264", audio_codec="aac",
                          temp_audiofile="temp-audio.m4a", remove_temp=True, threads=4, verbose=False, logger=None)
 
-    # Description (kaynak)
+    # Description
+    wiki_url = f"{WIKI}/wiki/{urllib.parse.quote(title.replace(' ','_'))}"
     description = (f"{title}\n\nShort factual video. No speculation, no fiction.\n\n"
-                   f"Source:\n- Wikipedia: https://en.wikipedia.org/wiki/{title.replace(' ','_')}"
+                   f"Source:\n- Wikipedia: {wiki_url}"
                    "\n\n#history #space #culture #facts #shorts")
     return RenderResult(video_path=out_path, title=title, description=description, tags=DEFAULT_TAGS)
 
@@ -391,14 +434,13 @@ def main() -> int:
     topic = pick_topic(seen)
     print(f"[AUTOYUSON] Topic: {topic}")
 
-    title, summary, url, image_urls = wiki_fetch(topic)
-    sources = [url]
-    narration, short_title, sentences = craft_script(title, summary, sources)
+    title, summary, page_url, image_urls = wiki_fetch(topic)
+    narration, short_title, sentences = craft_script(title, summary, page_url)
     if not is_factual_enough(narration):
-        summary2 = wikipedia.summary(title, sentences=5)
-        narration, short_title, sentences = craft_script(title, summary2, sources)
+        # summary zaten REST'ten; burada ek bir manevraya gerek yok
+        pass
 
-    # Görselleri indir
+    # Görseller
     bg_images: List[Image.Image] = []
     for u in image_urls:
         im = download_image(u)
