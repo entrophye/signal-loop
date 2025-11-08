@@ -1,29 +1,18 @@
 # -*- coding: utf-8 -*-
 """
-AUTOYUSON V7 — Quality-First, Fail-Safe Shorts (History / Space / Culture)
+AUTOYUSON V7.1 — Quality-First, Fail-Safe Shorts
 
-ÖZET
-- TTS: Otomatik seçim (ELEVEN_API_KEY varsa ElevenLabs, yoksa gTTS). FORCE_TTS=eleven|gtts ile override.
-- ElevenLabs voice: İSİM ya da VOICE_ID kabul eder; isim tutmazsa popülerlerden/ilk sesten akıllı fallback.
-- Tempo: atempo=0.92 + cümleler arası 320ms gerçek sessizlik (ffmpeg ile).
-- Altyazı: Konuşma süresine oranlı; min 2.0s / max 5.0s; okunur hız.
-- Görsel: Wikimedia high-res (min piksel kenarı ENV: IMG_MIN, varsayılan 1600). Yoksa procedural sinematik backdrop.
-- Müzik: assets/music/*.mp3 yoksa ffmpeg ile ambient üretir (reverb’lü sine + pink noise).
-- Encode: CRF 20, preset medium, yuv420p.
-- Log: TTS sağlayıcı, voice çözüm, görsel sayısı, müzik kaynağı, vs.
+Değişiklikler (V7.1):
+- Ambient müzik üretimi sağlamlaştırıldı (3 aşamalı fallback + yoksa sessizlik + son çare müziksiz).
+- Render, müzik dosyası gerçekten yoksa müziksiz devam ediyor (crash yok).
 
-ENV
-  YT_CLIENT_ID, YT_CLIENT_SECRET, YT_REFRESH_TOKEN  (veya TOKEN_JSON_BASE64)
-  LANGUAGE=en
-  VIDEO_DURATION=55
-  TITLE_PREFIX=
-  TOPICS_FILE=topics.txt
-  FORCE_TTS=eleven|gtts   (opsiyonel; verilmezse auto)
-  ELEVEN_API_KEY=...      (varsa ElevenLabs kullanılır)
-  ELEVEN_VOICE=Elli|Rachel|... ya da voice_id (opsiyonel; isim bulunamazsa otomatik)
-  PRIVACY_STATUS=public|unlisted|private
-  DISABLE_UPLOAD=true|false
-  IMG_MIN=1600            (Wikimedia görsel minimum kısa kenar)
+Genel:
+- TTS: Auto (ELEVEN varsa ElevenLabs, yoksa gTTS) veya FORCE_TTS=eleven|gtts
+- Eleven voice: isim veya voice_id; bulunamazsa akıllı seçim
+- Tempo: atempo=0.92 + cümle arası 320ms sessizlik
+- Altyazı: min 2.0s / max 5.0s, konuşma süresine oranlı
+- Görsel: Wikimedia hi-res (IMG_MIN) yoksa procedural sinematik
+- Encode: CRF 20, preset medium, yuv420p
 """
 
 import os, io, re, json, base64, random, pathlib, sys, urllib.parse, time, math, glob, subprocess
@@ -34,7 +23,7 @@ import requests
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont, ImageFilter, ImageOps
 
-# --- optional deps (movie, tts, youtube) ---
+# --- optional deps ---
 try:
     from gtts import gTTS
     _HAS_GTTS=True
@@ -64,9 +53,9 @@ TITLE_PREFIX = os.getenv("TITLE_PREFIX","").strip()
 PRIVACY_STATUS = (os.getenv("PRIVACY_STATUS","public").strip().lower() or "public")
 DISABLE_UPLOAD = os.getenv("DISABLE_UPLOAD","").strip().lower() in ("1","true","yes")
 
-FORCE_TTS = os.getenv("FORCE_TTS","").strip().lower()          # '', 'eleven', 'gtts'
+FORCE_TTS = os.getenv("FORCE_TTS","").strip().lower()  # '', 'eleven', 'gtts'
 ELEVEN_API_KEY = os.getenv("ELEVEN_API_KEY","").strip()
-ELEVEN_VOICE = os.getenv("ELEVEN_VOICE","").strip()            # name or voice_id (optional)
+ELEVEN_VOICE = os.getenv("ELEVEN_VOICE","").strip()    # name or voice_id
 
 IMG_MIN_EDGE = int(os.getenv("IMG_MIN","1600"))
 
@@ -77,7 +66,7 @@ ASSETS = pathlib.Path("assets"); ASSETS.mkdir(parents=True, exist_ok=True)
 
 W, H = 1080, 1920
 WIKI="https://en.wikipedia.org"; REST=f"{WIKI}/api/rest_v1"; API=f"{WIKI}/w/api.php"
-UA={"User-Agent":"autoyuson-v7 (+github)"}
+UA={"User-Agent":"autoyuson-v7.1 (+github)"}
 DEFAULT_TAGS=["history","space","astronomy","archaeology","culture","documentary","facts","shorts"]
 CURATED_TOPICS=[
     "Rosetta Stone","Dead Sea Scrolls","Hagia Sophia","Voyager Golden Record","Terracotta Army","Göbekli Tepe",
@@ -156,7 +145,6 @@ def wiki_fetch(topic):
         if m and "items" in m:
             for it in m["items"]:
                 if it.get("type")!="image": continue
-                # prefer 'original' if large enough
                 src=None
                 orig=it.get("original",{})
                 if orig and orig.get("source"):
@@ -345,21 +333,16 @@ def eleven_fetch_voices():
     return {v.get("name"): v.get("voice_id") for v in data if v.get("voice_id")}
 
 def eleven_resolve_voice_id(value: str) -> str:
-    """ELEVEN_VOICE adı veya voice_id olabilir; isim bulunamazsa popülerlerden/ilk sesten seçer."""
     val=(value or "").strip()
-    # voice_id gibi duruyorsa direkt kullan
     if len(val)>=20 and all(c.isalnum() or c in "-_" for c in val):
         return val
-    # liste çek
     by_name=eleven_fetch_voices()
     if val and val in by_name:
         return by_name[val]
-    # popülerlerden biri varsa onu seç
     prefer=["Rachel","Bella","Adam","Antoni","Elli","Brian","Sam"]
     for p in prefer:
         if p in by_name:
             return by_name[p]
-    # son çare: ilk ses
     if by_name:
         return list(by_name.values())[0]
     raise RuntimeError("ElevenLabs: hesapta hiç voice yok.")
@@ -402,7 +385,6 @@ def tts_gtts(narration, out_mp3, lang):
     os.replace(slowed,out_mp3)
 
 def choose_tts_provider()->str:
-    """FORCE_TTS ile override; aksi halde ELEVEN varsa eleven, yoksa gtts."""
     if FORCE_TTS in ("eleven","gtts"):
         return FORCE_TTS
     return "eleven" if ELEVEN_API_KEY else "gtts"
@@ -418,7 +400,6 @@ def synth_tts(sentences, narration, out_mp3, lang):
 
 # --------------- Subtitles -----------------
 def alloc_subs(sentences, voice_duration):
-    # okunur: min 2.0s, max 5.0s
     weights=[max(25,len(s)) for s in sentences]
     total=sum(weights); budget=voice_duration*0.92
     t=voice_duration*0.04
@@ -430,22 +411,52 @@ def alloc_subs(sentences, voice_duration):
         out.append((s,start,end)); t=end
     return out
 
-# --------------- Music ---------------------
-def pick_music():
+# --------------- Music (robust) -----------
+def _run_ffmpeg(cmd:list)->bool:
+    try:
+        r=subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return r.returncode==0
+    except Exception:
+        return False
+
+def gen_ambient_music(out_path:str, duration_sec:float)->Optional[str]:
+    """
+    3 aşamalı üretim:
+      A) sine+pink noise + reverb + lowpass
+      B) sadece pink noise + lowpass
+      C) tam sessizlik
+    Sonunda dosya varsa path döner; yoksa None.
+    """
+    ensure_ffmpeg()
+    dur=max(10,int(duration_sec))
+    # A) karma pad
+    cmdA=["ffmpeg","-y","-filter_complex",
+          ("aevalsrc=0|0[s0];"
+           "sine=d=0.1:f=220,afade=t=in:st=0:d=0.6,aloop=loop=-1:size=22050:start=0,atrim=0:{d},asetpts=N/SR/TB,volume=0.25[sine];"
+           "anoisesrc=d={d}:color=pink:amplitude=0.02[noi];"
+           "[sine][noi]amix=inputs=2:normalize=0,lowpass=f=4000,areverb=10:10:50:0.5:0.5:0.3,volume=0.9[aout]").format(d=dur),
+          "-map","[aout]","-t",str(dur), out_path]
+    if _run_ffmpeg(cmdA) and os.path.exists(out_path) and os.path.getsize(out_path)>0:
+        log("[MUSIC] ambient generated (pad+noise)"); return out_path
+    # B) sadece noise
+    cmdB=["ffmpeg","-y","-f","lavfi","-i",f"anoisesrc=d={dur}:color=pink:amplitude=0.015",
+          "-af","lowpass=f=3500,volume=0.9","-t",str(dur), out_path]
+    if _run_ffmpeg(cmdB) and os.path.exists(out_path) and os.path.getsize(out_path)>0:
+        log("[MUSIC] ambient generated (noise only)"); return out_path
+    # C) sessizlik
+    cmdC=["ffmpeg","-y","-f","lavfi","-i","anullsrc=r=44100:cl=mono","-t",str(dur), out_path]
+    if _run_ffmpeg(cmdC) and os.path.exists(out_path) and os.path.getsize(out_path)>0:
+        log("[MUSIC] ambient generated (silence)"); return out_path
+    log("[MUSIC] ambient generation failed — proceeding without music.")
+    try:
+        if os.path.exists(out_path) and os.path.getsize(out_path)==0:
+            os.remove(out_path)
+    except: pass
+    return None
+
+def pick_music()->Optional[str]:
     files=glob.glob(str(ASSETS/"music" / "*.mp3"))
     return random.choice(files) if files else None
-
-def gen_ambient_music(out_path, duration_sec):
-    dur=str(max(10,int(duration_sec)))
-    filt=("aevalsrc=0|0[s0];"
-          f"sine=d=0.1:f=220,afade=t=in:st=0:d=0.6,aloop=loop=-1:size=22050:start=0,atrim=0:{dur},asetpts=N/SR/TB,"
-          "volume=0.25[sine];"
-          f"anoisesrc=d={dur}:color=pink:amplitude=0.02[noi];"
-          "[sine][noi]amix=inputs=2:normalize=0,lowpass=f=4000,areverb=10:10:50:0.5:0.5:0.3,volume=0.9[aout]"
-          )
-    subprocess.run(["ffmpeg","-y","-filter_complex",filt,"-map","[aout]","-t",dur,out_path],
-                   stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
-    return out_path
 
 # --------------- YouTube -------------------
 def _read_oauth():
@@ -518,16 +529,26 @@ def render_video(title, sentences, narration_mp3, images, duration_hint, wiki_ti
         save_text(txt, fn, width=W-220, fontsize=36, bold=False)
         subs.append(ImageClip(fn).set_start(s).set_duration(e-s).set_position(("center",H-340)).fadein(0.10).fadeout(0.10))
 
-    # music
-    music_path=pick_music()
+    # --- Music (robust) ---
+    music_path = pick_music()
     if not music_path:
-        music_path=str(DATA/"ambient_autogen.mp3")
-        gen_ambient_music(music_path, duration)
+        music_path = str(DATA/"ambient_autogen.mp3")
+        produced = gen_ambient_music(music_path, duration)
+        if not produced:
+            music_path = None  # üretilemediyse müziksiz
 
-    voice_track=voice
-    music_track=AudioFileClip(music_path).volumex(0.12).audio_fadein(0.8).audio_fadeout(1.0)
+    audio_layers=[voice.set_start(0)]
+    if music_path and os.path.exists(music_path) and os.path.getsize(music_path)>0:
+        try:
+            music_track=AudioFileClip(music_path).volumex(0.12).audio_fadein(0.8).audio_fadeout(1.0)
+            audio_layers.append(music_track.set_duration(duration))
+            log(f"[MUSIC] using: {music_path}")
+        except Exception as e:
+            log(f"[MUSIC] failed to load, proceeding without music: {e}")
+    else:
+        log("[MUSIC] no music file present; proceeding without music")
 
-    comp_audio=CompositeAudioClip([voice_track.set_start(0), music_track.set_duration(duration)]).fx(afx.audio_normalize)
+    comp_audio=CompositeAudioClip([a.fx(afx.audio_normalize) for a in audio_layers])
     comp=(CompositeVideoClip([broll, title_clip, *subs]).set_audio(comp_audio).set_duration(duration))
 
     out=f"{safe_title.replace(' ','_')[:80]}.mp4"
