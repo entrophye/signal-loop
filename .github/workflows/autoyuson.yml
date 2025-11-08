@@ -1,4 +1,4 @@
-name: Autoyuson — Factual Shorts (Cinematic v3)
+name: Autoyuson — Factual Shorts (Cinematic v6 - Eleven)
 
 on:
   workflow_dispatch:
@@ -21,6 +21,7 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: 'pip'
 
       - name: Install ffmpeg
         run: |
@@ -34,9 +35,10 @@ jobs:
           python -m pip install --no-cache-dir numpy==1.26.4
           python -m pip install --no-cache-dir imageio==2.31.1 imageio-ffmpeg==0.4.8
           python -m pip install --no-cache-dir moviepy==1.0.3 pillow==9.5.0
-          python -m pip install --no-cache-dir requests edge-tts aiofiles gTTS
-          python -m pip install --no-cache-dir pydub soundfile
+          python -m pip install --no-cache-dir requests pydub soundfile
+          # YouTube API
           python -m pip install --no-cache-dir google-api-python-client google-auth-httplib2 google-auth-oauthlib
+          # quick sanity
           python - << 'PY'
           import sys, moviepy, imageio, numpy
           import moviepy.editor as m
@@ -73,16 +75,22 @@ jobs:
           print("Secrets preflight OK.")
           PY
 
-      - name: Run Autoyuson
+      - name: Run Autoyuson (ElevenLabs)
         env:
+          # YouTube
           YT_CLIENT_ID: ${{ secrets.YT_CLIENT_ID }}
           YT_CLIENT_SECRET: ${{ secrets.YT_CLIENT_SECRET }}
           YT_REFRESH_TOKEN: ${{ secrets.YT_REFRESH_TOKEN }}
           TOKEN_JSON_BASE64: ${{ secrets.TOKEN_JSON_BASE64 }}
+          # Autoyuson
           LANGUAGE: "en"
           VIDEO_DURATION: "55"
           TITLE_PREFIX: ""
-          EDGE_TTS_VOICE: "en-US-JennyNeural"
+          PRIVACY_STATUS: "public"
+          # TTS (ZORUNLU)
+          FORCE_TTS: "eleven"
+          ELEVEN_API_KEY: ${{ secrets.ELEVEN_API_KEY }}
+          ELEVEN_VOICE: "Elli"
         run: |
           python main_autoyuson.py
 
