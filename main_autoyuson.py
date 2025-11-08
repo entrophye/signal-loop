@@ -1,30 +1,29 @@
 # -*- coding: utf-8 -*-
 """
-AUTOYUSON V5 — Cinematic Factual Shorts (History / Space / Culture)
+AUTOYUSON V6 — Quality-First, Fail-Safe Shorts
 
-Kalite odaklı tam yeniden yazım:
-- TTS: ElevenLabs REST (SDK yok), yoksa gTTS. FORCE_TTS=edge|gtts|eleven (edge devre dışı: bu dosya edge kullanmıyor)
-- Tempo: atempo 0.92 + cümleler arası 320ms sessizlik (ffmpeg ile)
-- Altyazı: konuşma süresine oranlı, min 1.2s / max 4.0s, okunur hız
-- Görseller: Wikimedia 'original' alanı, min 1600x1600, akıllı ölçek + hafif sharpen + sıcak grade + vignette + grain
-- Müzik: assets/music/*.mp3 rastgele, düşük volüm, fade-in/out
-- Encode: crf 20, preset medium, yuv420p
-- Loglar: TTS seçimi, elenen görseller, altyazı metrikleri
+Garantiler:
+- Görsel her durumda 1080x1920 sinematik (Wikimedia original -> yoksa procedural)
+- TTS sağlayıcı ZORUNLU (FORCE_TTS=eleven|gtts); yanlış fallback yok; tempo yavaşlatma + 320ms durak
+- Altyazı gerçek ses süresine oranlı (min 2.0s, max 5.0s), okunabilir
+- Müzik yoksa ffmpeg ile yerinde ambient üretimi
+- Encode: CRF 20, preset medium, yuv420p
+- Net loglar
 
 ENV:
-  YT_CLIENT_ID, YT_CLIENT_SECRET, YT_REFRESH_TOKEN  (veya TOKEN_JSON_BASE64)
   LANGUAGE=en
   VIDEO_DURATION=55
   TITLE_PREFIX=
   TOPICS_FILE=topics.txt
-  ELEVEN_API_KEY=<key>
-  ELEVEN_VOICE=Elli|Adam|Antoni|... (isteğe bağlı, ad ile eşleşme yapılır)
+  FORCE_TTS=eleven|gtts
+  ELEVEN_API_KEY=sk_cb6d0517c20f436358adc55a8c59b210582a8bb95aadc217   (FORCE_TTS=eleven ise zorunlu)
+  ELEVEN_VOICE=Elli|Adam|Antoni (opsiyonel, varsayılan Elli)
   PRIVACY_STATUS=public|unlisted|private
   DISABLE_UPLOAD=true|false
-  FORCE_TTS=eleven|gtts
+  (YouTube için: YT_CLIENT_ID, YT_CLIENT_SECRET, YT_REFRESH_TOKEN veya TOKEN_JSON_BASE64)
 """
 
-import os, io, re, json, base64, random, pathlib, sys, urllib.parse, math, time, glob, subprocess
+import os, io, re, json, base64, random, pathlib, sys, urllib.parse, time, math, glob, subprocess
 from dataclasses import dataclass
 from typing import List, Tuple, Optional
 
@@ -32,6 +31,7 @@ import requests
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont, ImageFilter, ImageOps
 
+# --- opsiyonel ---
 try:
     from gtts import gTTS
     _HAS_GTTS=True
@@ -54,25 +54,25 @@ try:
 except Exception:
     _HAS_GOOGLE=False
 
-# -------- Config
+# ---------- Config ----------
 LANG = (os.getenv("LANGUAGE","en").strip() or "en")[:5]
 DURATION_TARGET = int(os.getenv("VIDEO_DURATION","55"))
 TITLE_PREFIX = os.getenv("TITLE_PREFIX","").strip()
 PRIVACY_STATUS = (os.getenv("PRIVACY_STATUS","public").strip().lower() or "public")
 DISABLE_UPLOAD = os.getenv("DISABLE_UPLOAD","").strip().lower() in ("1","true","yes")
-FORCE_TTS = os.getenv("FORCE_TTS","").strip().lower()  # 'eleven' | 'gtts' | ''
-ELEVEN_API_KEY = os.getenv("ELEVEN_API_KEY","").strip()
-ELEVEN_VOICE = os.getenv("ELEVEN_VOICE","").strip() or "Elli"
 
-DATA = pathlib.Path("data"); DATA.mkdir(exist_ok=True, parents=True)
+FORCE_TTS = os.getenv("FORCE_TTS","").strip().lower()   # 'eleven' | 'gtts'
+ELEVEN_API_KEY = os.getenv("ELEVEN_API_KEY","").strip()
+ELEVEN_VOICE = os.getenv("ELEVEN_VOICE","Elli").strip() or "Elli"
+
+DATA = pathlib.Path("data"); DATA.mkdir(parents=True, exist_ok=True)
 SEEN = DATA/"seen_topics.json"
 FONTS = pathlib.Path("fonts"); FONTS.mkdir(exist_ok=True)
 ASSETS = pathlib.Path("assets"); ASSETS.mkdir(exist_ok=True)
 
-W,H = 1080,1920
+W, H = 1080, 1920
 WIKI="https://en.wikipedia.org"; REST=f"{WIKI}/api/rest_v1"; API=f"{WIKI}/w/api.php"
-UA={"User-Agent":"autoyuson-v5 (+github)"}
-
+UA={"User-Agent":"autoyuson-v6 (+github)"}
 DEFAULT_TAGS=["history","space","astronomy","archaeology","culture","documentary","facts","shorts"]
 CURATED_TOPICS=[
     "Rosetta Stone","Dead Sea Scrolls","Hagia Sophia","Voyager Golden Record","Terracotta Army","Göbekli Tepe",
@@ -82,9 +82,9 @@ CURATED_TOPICS=[
     "Antikythera mechanism","I Ching","Shahnameh","Silk Road","Machu Picchu","Moai","Çatalhöyük"
 ]
 
-# -------- Utils
 def log(x): print(x, flush=True)
 
+# ---------- Seen/Topics ----------
 def load_seen():
     if SEEN.exists():
         try: return json.loads(SEEN.read_text(encoding="utf-8"))
@@ -113,18 +113,18 @@ def pick_topic(seen):
             return t
     return (pool[0] if pool else "Göbekli Tepe")
 
-# -------- Wikipedia
+# ---------- Wikipedia ----------
 def _rest_summary(title):
     u=f"{REST}/page/summary/{urllib.parse.quote(title)}"
     try:
-        r=requests.get(u,headers=UA,timeout=20); 
+        r=requests.get(u,headers=UA,timeout=20)
         return r.json() if r.status_code==200 else None
     except: return None
 
 def _rest_media(title):
     u=f"{REST}/page/media/{urllib.parse.quote(title)}"
     try:
-        r=requests.get(u,headers=UA,timeout=20); 
+        r=requests.get(u,headers=UA,timeout=20)
         return r.json() if r.status_code==200 else None
     except: return None
 
@@ -134,7 +134,8 @@ def _opensearch(q):
             "action":"opensearch","search":q,"limit":5,"namespace":0,"format":"json"
         })
         if r.status_code!=200: return []
-        d=r.json(); return d[1] if isinstance(d,list) and len(d)>=2 else []
+        d=r.json()
+        return d[1] if isinstance(d,list) and len(d)>=2 else []
     except: return []
 
 def wiki_fetch(topic):
@@ -150,16 +151,12 @@ def wiki_fetch(topic):
         if m and "items" in m:
             for it in m["items"]:
                 if it.get("type")!="image": continue
-                # 'original' varsa onu kullan
                 orig=it.get("original",{})
                 src=None
                 if orig and orig.get("source"):
-                    src=orig["source"]
                     w=orig.get("width",0); h=orig.get("height",0)
-                    if min(w,h)<1600:  # düşük çözünürlük ele
-                        src=None
+                    if min(w,h)>=1600: src=orig["source"]
                 if not src:
-                    # srcset içinde en yüksek ölçek
                     ss=sorted(it.get("srcset",[]), key=lambda x: x.get("scale",1.0))
                     if ss: src=ss[-1].get("src")
                 if not src: src=it.get("src")
@@ -182,25 +179,7 @@ def download_image(url):
         return im
     except: return None
 
-# -------- Script
-def craft_script(title, summary):
-    clean=re.sub(r"\s+"," ", summary).strip()
-    cold=f"{title}. Verified, preserved, undeniable."
-    hook="What changed our understanding? Evidence — not legend."
-    words=clean.split()
-    fact1=" ".join(words[:40]) if words else clean
-    fact2=" ".join(words[40:80]) or clean
-    fact3=" ".join(words[80:120]) or clean
-    close="History survives by proof — and by those who keep looking."
-    sents=[cold,hook,fact1,fact2,fact3,close]
-    narration=" ".join(sents)
-    return narration, title, sents
-
-def factual_ok(text):
-    if any(k in text.lower() for k in ["reportedly","allegedly","legend","rumor"]): return False
-    n=len(text.split()); return 80<=n<=260
-
-# -------- Fonts/Text
+# ---------- Fonts/Text ----------
 REG=FONTS/"NotoSans-Regular.ttf"; BLD=FONTS/"NotoSans-Bold.ttf"
 def ensure_fonts():
     urls={
@@ -214,13 +193,12 @@ def ensure_fonts():
                 p.write_bytes(r.content)
             except: pass
 
-def get_font(size=48,bold=False):
-    try:
-        return ImageFont.truetype(str(BLD if bold else REG), size=size)
+def font(size=48,bold=False):
+    try: return ImageFont.truetype(str(BLD if bold else REG), size=size)
     except: return ImageFont.load_default()
 
 def text_box(text,width,fontsize,bold=False,fg=(255,255,255),bg=(0,0,0,150)):
-    f=get_font(fontsize,bold)
+    f=font(fontsize,bold)
     tmp=Image.new("RGBA",(width,1200),(0,0,0,0)); d=ImageDraw.Draw(tmp)
     words=text.split(); lines=[]; cur=""
     for w in words:
@@ -229,9 +207,10 @@ def text_box(text,width,fontsize,bold=False,fg=(255,255,255),bg=(0,0,0,150)):
         if wpx>width-40:
             if cur: lines.append(cur); cur=w
             else: lines.append(w); cur=""
-        else: cur=t
+        else:
+            cur=t
     if cur: lines.append(cur)
-    ascent,descent=f.getmetrics() if hasattr(f,"getmetrics") else (fontsize,int(fontsize*0.25))
+    ascent,descent=(f.getmetrics() if hasattr(f,"getmetrics") else (fontsize,int(fontsize*0.25)))
     lh=ascent+descent+6
     line_w=[d.textlength(x,font=f) for x in lines] or [width//2]
     box_w=min(width, int(max(line_w))+36); box_h=lh*len(lines)+28
@@ -247,141 +226,72 @@ def text_box(text,width,fontsize,bold=False,fg=(255,255,255),bg=(0,0,0,150)):
 def save_text(text,out,width,fontsize,bold=False):
     img=text_box(text,width,fontsize,bold); img.save(out,"PNG")
 
-# -------- TTS (ElevenLabs REST + gTTS fallback)
-ELEVEN_API="https://api.elevenlabs.io/v1"
+def sanitize_title(t):
+    t=re.sub(r"[^-\w\s.,()]+","",t).strip()
+    return (t or "Untitled")[:64]
 
-def _eleven_headers():
-    return {
-        "accept":"audio/mpeg",
-        "content-type":"application/json",
-        "xi-api-key": ELEVEN_API_KEY
-    }
-
-def eleven_voice_id(name):
-    cache=DATA/"eleven_voices.json"
-    voices=None
-    if cache.exists() and time.time()-cache.stat().st_mtime<3600:
-        try: voices=json.loads(cache.read_text(encoding="utf-8"))
-        except: voices=None
-    if voices is None:
-        r=requests.get(f"{ELEVEN_API}/voices",headers={"xi-api-key":ELEVEN_API_KEY},timeout=20)
-        r.raise_for_status()
-        data=r.json(); voices={v["name"]:v["voice_id"] for v in data.get("voices",[])}
-        cache.write_text(json.dumps(voices,ensure_ascii=False,indent=2),encoding="utf-8")
-    return voices.get(name)
-
-def tts_eleven(sentences, out_mp3, voice_name):
-    vid=eleven_voice_id(voice_name)
-    if not vid: raise RuntimeError("ElevenLabs voice id bulunamadı.")
-    # cümle bazlı üret ve aralara 320ms sessizlik ekle
-    parts=[]
-    for i, s in enumerate(sentences):
-        payload={
-            "text": s,
-            "model_id": "eleven_multilingual_v2",
-            "voice_settings":{
-                "stability":0.45, "similarity_boost":0.92, "style":0.45, "use_speaker_boost":True
-            }
-        }
-        rq=requests.post(f"{ELEVEN_API}/text-to-speech/{vid}",
-                         headers=_eleven_headers(), data=json.dumps(payload).encode("utf-8"), timeout=60)
-        rq.raise_for_status()
-        p=f"piece_{i}.mp3"; open(p,"wb").write(rq.content); parts.append(p)
-        # son parça değilse sessizlik
-        if i<len(sentences)-1:
-            sil=f"sil_{i}.wav"
-            subprocess.run(["ffmpeg","-y","-f","lavfi","-i","anullsrc=r=44100:cl=mono","-t","0.32",sil],
-                           stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
-            parts.append(sil)
-    # concat
-    lst="concat.txt"; open(lst,"w",encoding="utf-8").write("\n".join([f"file '{p}'" for p in parts]))
-    subprocess.run(["ffmpeg","-y","-f","concat","-safe","0","-i",lst,"-c","copy",out_mp3],
-                   stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
-    # tempo (yavaşlat)
-    slowed="tmp_slow.mp3"
-    subprocess.run(["ffmpeg","-y","-i",out_mp3,"-filter:a","atempo=0.92",slowed],
-                   stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
-    os.replace(slowed,out_mp3)
-    # temizlik
-    for p in parts:
-        try: os.remove(p)
-        except: pass
-    try: os.remove(lst)
-    except: pass
-
-def tts_gtts(text, out_mp3, lang):
-    if not _HAS_GTTS: raise RuntimeError("gTTS yok.")
-    gTTS(text=text,lang=lang,tld="com").save(out_mp3)
-    # tempo yavaşlat
-    slowed="tmp_slow.mp3"
-    subprocess.run(["ffmpeg","-y","-i",out_mp3,"-filter:a","atempo=0.92",slowed],
-                   stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
-    os.replace(slowed,out_mp3)
-
-def synth_tts(sentences, narration, out_mp3, lang):
-    log(f"[TTS] FORCE_TTS={FORCE_TTS or '-'} ELEVEN={'yes' if ELEVEN_API_KEY else 'no'} GTTS={'yes' if _HAS_GTTS else 'no'}")
-    if FORCE_TTS=="eleven":
-        if not ELEVEN_API_KEY: raise RuntimeError("FORCE_TTS=eleven fakat ELEVEN_API_KEY yok.")
-        tts_eleven(sentences, out_mp3, ELEVEN_VOICE); log("[TTS] Provider=ElevenLabs"); return
-    if FORCE_TTS=="gtts":
-        tts_gtts(narration, out_mp3, lang); log("[TTS] Provider=gTTS"); return
-    # otomatik
-    if ELEVEN_API_KEY:
-        try: tts_eleven(sentences, out_mp3, ELEVEN_VOICE); log("[TTS] Provider=ElevenLabs (auto)"); return
-        except Exception as e:
-            log(f"[TTS] ElevenLabs failed -> gTTS: {e}")
-    tts_gtts(narration, out_mp3, lang); log("[TTS] Provider=gTTS (fallback)")
-
-# -------- Audio helpers
-def pick_music():
-    files=glob.glob(str(ASSETS/"music" / "*.mp3"))
-    return random.choice(files) if files else None
-
-# -------- Visuals
+# ---------- Visuals ----------
 def fit_center_crop(img, w=W, h=H):
     r=img.width/img.height; rf=w/h
-    if r>rf:
-        new_h=h; new_w=int(r*new_h)
-    else:
-        new_w=w; new_h=int(new_w/r)
+    if r>rf: new_h=h; new_w=int(r*new_h)
+    else:    new_w=w; new_h=int(new_w/r)
     img=img.resize((new_w,new_h),Image.LANCZOS)
     L=(img.width-w)//2; T=(img.height-h)//2
     return img.crop((L,T,L+w,T+h))
 
-def apply_grade(img):
+def grade(img):
     w,h=img.size
-    graded=ImageOps.colorize(ImageOps.grayscale(img), black="#0c0c0c", white="#f1e6d7").convert("RGB")
+    graded=ImageOps.colorize(ImageOps.grayscale(img), black="#0c0c0c", white="#efe3d2").convert("RGB")
     graded=Image.blend(img, graded, 0.20)
-    # hafif sharpen
     graded=graded.filter(ImageFilter.UnsharpMask(radius=1.2, percent=120, threshold=4))
-    # vignette
     mask=Image.new("L",(w,h),160); draw=ImageDraw.Draw(mask)
     m=int(min(w,h)*0.28); draw.ellipse((m,m,w-m,h-m), fill=0); mask=mask.filter(ImageFilter.GaussianBlur(85))
     overlay=Image.new("RGBA",(w,h),(0,0,0,255)); overlay.putalpha(mask)
-    base=graded.convert("RGBA")
-    vig=Image.alpha_composite(base, overlay).convert("RGB")
-    # grain
+    base=graded.convert("RGBA"); vig=Image.alpha_composite(base, overlay).convert("RGB")
     noise=(np.random.randn(h,w)*5).clip(-10,10).astype(np.int16)
-    arr=np.array(vig).astype(np.int16); arr=np.clip(arr + noise[:,:,None],0,255).astype(np.uint8)
+    arr=np.array(vig).astype(np.int16); arr=np.clip(arr+noise[:,:,None],0,255).astype(np.uint8)
     return Image.fromarray(arr)
 
-def prepare_images(img_urls):
+def procedural_backdrop(title):
+    # gradient + subtle shapes + grade
+    base=Image.new("RGB",(W,H),(18,18,22))
+    grad=Image.new("L",(1,H))
+    for y in range(H):
+        grad.putpixel((0,y), int(40+ (215-40)*(y/H)))
+    grad=grad.resize((W,H))
+    tint=Image.merge("RGB",(grad, Image.new("L",(W,H),0), Image.new("L",(W,H),0)))
+    img=Image.blend(base,tint,0.20)
+    # soft shapes
+    shp=Image.new("RGBA",(W,H),(0,0,0,0))
+    d=ImageDraw.Draw(shp)
+    for _ in range(5):
+        rx=random.randint(200,500); ry=random.randint(200,500)
+        x=random.randint(-200,W-100); y=random.randint(-200,H-100)
+        d.ellipse((x,y,x+rx,y+ry), fill=(255,120,60,30))
+    img=Image.alpha_composite(img.convert("RGBA"), shp).convert("RGB")
+    img=grade(img)
+    # title watermark
+    wm=text_box(sanitize_title(title), W, 54, bold=True, fg=(255,255,255), bg=(0,0,0,0))
+    canvas=img.copy()
+    canvas.paste(wm, ((W-wm.width)//2, 90), wm)
+    return canvas
+
+def prepare_images(img_urls, title):
     imgs=[]; dropped=0
     for u in img_urls:
         im=download_image(u)
         if not im: continue
         if min(im.size)<1600:
             dropped+=1; continue
-        im=fit_center_crop(im, W, H)
-        im=apply_grade(im)
-        imgs.append(im)
+        im=fit_center_crop(im,W,H); im=grade(im); imgs.append(im)
         if len(imgs)>=6: break
     if not imgs:
-        imgs=[Image.new("RGB",(W,H),(22,22,26))]
-    log(f"[IMG] accepted={len(imgs)} dropped(lowres)={dropped}")
+        imgs=[procedural_backdrop(title)]
+        log("[IMG] Wikimedia görseli bulunamadı. Procedural arka plan üretildi.")
+    log(f"[IMG] accepted={len(imgs)} dropped_lowres={dropped}")
     return imgs
 
-def ken_burns_frame(img, duration, z0=1.05, z1=1.12):
+def ken_burns(img, duration, z0=1.05, z1=1.12):
     from moviepy.editor import ImageClip
     tmp=f"kb_{int(time.time()*1000)}.jpg"; img.save(tmp,quality=92)
     clip=ImageClip(tmp).set_duration(duration)
@@ -390,41 +300,120 @@ def ken_burns_frame(img, duration, z0=1.05, z1=1.12):
 def build_broll(images, duration):
     from moviepy.editor import CompositeVideoClip
     if len(images)==1:
-        return ken_burns_frame(images[0], duration)
-    per=max(3.8, min(7.0, duration/len(images))); fc=0.45
+        return ken_burns(images[0], duration)
+    per=max(4.0, min(7.0, duration/len(images))); fc=0.45
     layers=[]; t=0.0
     for im in images:
-        c=ken_burns_frame(im, per).set_start(t).crossfadein(fc).crossfadeout(fc)
+        c=ken_burns(im, per).set_start(t).crossfadein(fc).crossfadeout(fc)
         layers.append(c); t+= per - fc
     return CompositeVideoClip(layers).set_duration(duration)
 
-# -------- Subtitles (duration-proportional)
+# ---------- TTS (strict) ----------
+def ensure_ffmpeg():
+    if not shutil_which("ffmpeg"):
+        raise RuntimeError("ffmpeg bulunamadı (FFMPEG gerekli).")
+def shutil_which(x):
+    from shutil import which; return which(x) is not None
+
+ELEVEN_API="https://api.elevenlabs.io/v1"
+def eleven_headers():
+    return {"accept":"audio/mpeg","content-type":"application/json","xi-api-key":ELEVEN_API_KEY}
+
+def eleven_voice_id_by_name(name):
+    cache=DATA/"eleven_voices.json"
+    voices=None
+    if cache.exists() and time.time()-cache.stat().st_mtime<3600:
+        try: voices=json.loads(cache.read_text(encoding="utf-8"))
+        except: voices=None
+    if voices is None:
+        r=requests.get(f"{ELEVEN_API}/voices", headers={"xi-api-key":ELEVEN_API_KEY}, timeout=20)
+        r.raise_for_status()
+        data=r.json(); voices={v["name"]:v["voice_id"] for v in data.get("voices",[])}
+        cache.write_text(json.dumps(voices,ensure_ascii=False,indent=2),encoding="utf-8")
+    return voices.get(name)
+
+def tts_eleven(sentences, out_mp3, voice_name):
+    vid=eleven_voice_id_by_name(voice_name)
+    if not vid: raise RuntimeError("ElevenLabs voice id bulunamadı.")
+    parts=[]
+    for i,s in enumerate(sentences):
+        payload={"text": s,"model_id":"eleven_multilingual_v2",
+                 "voice_settings":{"stability":0.45,"similarity_boost":0.92,"style":0.45,"use_speaker_boost":True}}
+        rq=requests.post(f"{ELEVEN_API}/text-to-speech/{vid}",
+                         headers=eleven_headers(), data=json.dumps(payload).encode("utf-8"), timeout=60)
+        rq.raise_for_status()
+        piece=f"piece_{i}.mp3"; open(piece,"wb").write(rq.content); parts.append(piece)
+        if i<len(sentences)-1:
+            sil=f"sil_{i}.wav"
+            subprocess.run(["ffmpeg","-y","-f","lavfi","-i","anullsrc=r=44100:cl=mono","-t","0.32",sil],
+                           stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+            parts.append(sil)
+    lst="concat.txt"; open(lst,"w",encoding="utf-8").write("\n".join([f"file '{p}'" for p in parts]))
+    subprocess.run(["ffmpeg","-y","-f","concat","-safe","0","-i",lst,"-c","copy",out_mp3],
+                   stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+    # tempo: yavaşlat
+    slowed="tmp_slow.mp3"
+    subprocess.run(["ffmpeg","-y","-i",out_mp3,"-filter:a","atempo=0.92",slowed],
+                   stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+    os.replace(slowed,out_mp3)
+    for p in parts:
+        try: os.remove(p)
+        except: pass
+    try: os.remove(lst)
+    except: pass
+
+def tts_gtts(narration, out_mp3, lang):
+    if not _HAS_GTTS: raise RuntimeError("gTTS yok. FORCE_TTS=gtts kullanılamaz.")
+    gTTS(text=narration,lang=lang,tld="com").save(out_mp3)
+    slowed="tmp_slow.mp3"
+    subprocess.run(["ffmpeg","-y","-i",out_mp3,"-filter:a","atempo=0.92",slowed],
+                   stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+    os.replace(slowed,out_mp3)
+
+def synth_tts(sentences, narration, out_mp3, lang):
+    log(f"[TTS] FORCE_TTS={FORCE_TTS} ELEVEN_KEY={'yes' if ELEVEN_API_KEY else 'no'} GTTS={'yes' if _HAS_GTTS else 'no'}")
+    if FORCE_TTS not in ("eleven","gtts"):
+        raise RuntimeError("FORCE_TTS zorunlu: 'eleven' veya 'gtts' olarak ayarla.")
+    if FORCE_TTS=="eleven":
+        if not ELEVEN_API_KEY: raise RuntimeError("FORCE_TTS=eleven ama ELEVEN_API_KEY yok.")
+        tts_eleven(sentences, out_mp3, ELEVEN_VOICE); log("[TTS] Provider=ElevenLabs"); return
+    else:
+        tts_gtts(narration, out_mp3, lang); log("[TTS] Provider=gTTS")
+
+# ---------- Subtitles ----------
 def alloc_subs(sentences, voice_duration):
-    weights=[max(20,len(s)) for s in sentences]  # karakter ağırlığı
-    total=sum(weights)
-    # toplam video sesi içinde %92'lik kısmı altyazıya ayır, baş/son nefes için 8%
-    budget=voice_duration*0.92
-    times=[]
+    # Daha yavaş, okunabilir: min 2.0s, max 5.0s
+    weights=[max(25,len(s)) for s in sentences]
+    total=sum(weights); budget=voice_duration*0.92
     t=voice_duration*0.04
-    for i,w in enumerate(weights):
-        chunk=max(1.2, min(4.0, budget*(w/total)))  # 1.2s–4.0s
-        times.append((sentences[i], t, t+chunk))
-        t+=chunk
-    # taşmalar düzelt
-    times=[(txt, max(0.3,s), min(voice_duration-0.2,e)) for (txt,s,e) in times]
-    return times
+    out=[]
+    for s in sentences:
+        chunk=budget*(max(25,len(s))/total)
+        chunk=max(2.0, min(5.0, chunk))
+        start=t; end=min(voice_duration-0.2, start+chunk)
+        out.append((s,start,end)); t=end
+    return out
 
-# -------- Title/Desc
-def sanitize_title(t): 
-    t=re.sub(r"[^-\w\s.,()]+","",t).strip()
-    return (t or "Untitled")[:64]
+# ---------- Music ----------
+def pick_music():
+    files=glob.glob(str(ASSETS/"music" / "*.mp3"))
+    return random.choice(files) if files else None
 
-def youtube_desc(title, wiki_title):
-    wiki_url=f"{WIKI}/wiki/{urllib.parse.quote(wiki_title)}"
-    return (f"{title}\n\nShort factual video. No speculation, no fiction.\n\n"
-            f"Source:\n- Wikipedia: {wiki_url}\n\n#history #space #culture #facts #shorts")
+def gen_ambient_music(out_path, duration_sec):
+    # ffmpeg ile procedural ambient: sine pad + noise + reverb + lowpass
+    #  (internet yoksa da çalışır)
+    dur=str(max(10,int(duration_sec)))
+    filt=("aevalsrc=0|0[s0];"
+          f"sine=d=0.1:f=220,afade=t=in:st=0:d=0.6,aloop=loop=-1:size=22050:start=0,atrim=0:{dur},asetpts=N/SR/TB,"
+          "volume=0.25[sine];"
+          f"anoisesrc=d={dur}:color=pink:amplitude=0.02[noi];"
+          "[sine][noi]amix=inputs=2:normalize=0,lowpass=f=4000,areverb=10:10:50:0.5:0.5:0.3,volume=0.9[aout]"
+          )
+    subprocess.run(["ffmpeg","-y","-filter_complex",filt,"-map","[aout]","-t",dur,out_path],
+                   stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+    return out_path
 
-# -------- YouTube
+# ---------- YouTube ----------
 def _read_oauth():
     cid=os.getenv("YT_CLIENT_ID","").strip()
     cs=os.getenv("YT_CLIENT_SECRET","").strip()
@@ -462,44 +451,70 @@ def upload_youtube(path,title,desc,tags,cat="27",privacy="public"):
         status, resp = req.next_chunk()
     return resp.get("id","")
 
-# -------- Render
+# ---------- Script ----------
+def craft_script(title, summary):
+    clean=re.sub(r"\s+"," ", summary).strip()
+    cold=f"{title}. Verified, preserved, undeniable."
+    hook="What changed our understanding? Evidence — not legend."
+    words=clean.split()
+    fact1=" ".join(words[:40]) if words else clean
+    fact2=" ".join(words[40:80]) or clean
+    fact3=" ".join(words[80:120]) or clean
+    close="History survives by proof — and by those who keep looking."
+    sents=[cold,hook,fact1,fact2,fact3,close]
+    narration=" ".join(sents)
+    return narration, title, sents
+
+def factual_ok(text):
+    if any(k in text.lower() for k in ["reportedly","allegedly","legend","rumor"]): return False
+    n=len(text.split()); return 80<=n<=260
+
+# ---------- Render ----------
 @dataclass
 class Result: path:str; title:str; desc:str; tags:List[str]
+
+def youtube_desc(title, wiki_title):
+    wiki_url=f"{WIKI}/wiki/{urllib.parse.quote(wiki_title)}"
+    return (f"{title}\n\nShort factual video. No speculation, no fiction.\n\n"
+            f"Source:\n- Wikipedia: {wiki_url}\n\n#history #space #culture #facts #shorts")
 
 def render_video(title, sentences, narration_mp3, images, duration_hint, wiki_title):
     from moviepy.editor import ImageClip, AudioFileClip, CompositeVideoClip, CompositeAudioClip
 
+    ensure_ffmpeg()
     ensure_fonts()
-    safe_title=sanitize_title(title)
 
     voice=AudioFileClip(narration_mp3)
     duration=max(min(max(duration_hint,48),75), voice.duration+0.6)
 
-    # b-roll
+    # Görsel katman
     broll=build_broll(images, duration)
 
-    # title
+    # Başlık
+    safe_title=sanitize_title(title)
     title_png=f"title_{int(time.time())}.png"
     save_text(safe_title, title_png, width=W-140, fontsize=58, bold=True)
     title_clip=ImageClip(title_png).set_duration(min(5.0,duration*0.22)).set_position(("center",72)).fadein(0.3).fadeout(0.3)
 
-    # subtitles
+    # Altyazı (yavaş ve okunur)
     subs=[]
     subs_times=alloc_subs(sentences, voice.duration)
     sub_pngs=[]
     for i,(txt,s,e) in enumerate(subs_times):
         fn=f"sub_{i:03d}.png"; sub_pngs.append(fn)
         save_text(txt, fn, width=W-220, fontsize=36, bold=False)
-        subs.append(ImageClip(fn).set_start(s).set_duration(e-s).set_position(("center",H-340)).fadein(0.08).fadeout(0.08))
+        subs.append(ImageClip(fn).set_start(s).set_duration(e-s).set_position(("center",H-340)).fadein(0.10).fadeout(0.10))
 
-    # music (optional)
-    music_path=pick_music()
-    audio_layers=[voice.set_start(0)]
-    if music_path:
-        music=AudioFileClip(music_path).volumex(0.12).audio_fadein(0.6).audio_fadeout(0.8)
-        audio_layers.append(music.set_duration(duration))
+    # Müzik
+    music_path = pick_music()
+    if not music_path:
+        music_path=str(DATA/"ambient_autogen.mp3")
+        gen_ambient_music(music_path, duration)
 
-    comp_audio=CompositeAudioClip([a.fx(afx.audio_normalize) for a in audio_layers])
+    voice_track=voice
+    music_track=AudioFileClip(music_path).volumex(0.12).audio_fadein(0.8).audio_fadeout(1.0)
+
+    comp_audio=CompositeAudioClip([voice_track.set_start(0), music_track.set_duration(duration)]).fx(afx.audio_normalize)
     comp=(CompositeVideoClip([broll, title_clip, *subs]).set_audio(comp_audio).set_duration(duration))
 
     out=f"{safe_title.replace(' ','_')[:80]}.mp4"
@@ -509,7 +524,6 @@ def render_video(title, sentences, narration_mp3, images, duration_hint, wiki_ti
         ffmpeg_params=["-crf","20","-preset","medium","-pix_fmt","yuv420p"]
     )
 
-    # cleanup
     try:
         os.remove(title_png)
         for f in sub_pngs:
@@ -519,10 +533,14 @@ def render_video(title, sentences, narration_mp3, images, duration_hint, wiki_ti
     desc=youtube_desc(title, wiki_title)
     return Result(out, title, desc, DEFAULT_TAGS)
 
-# -------- Main
+# ---------- Main ----------
 def main():
     if not _HAS_MOVIEPY:
         raise RuntimeError("MoviePy gerekli.")
+    if FORCE_TTS not in ("eleven","gtts"):
+        raise RuntimeError("FORCE_TTS='eleven' veya 'gtts' olarak ayarlanmalı.")
+    if FORCE_TTS=="eleven" and not ELEVEN_API_KEY:
+        raise RuntimeError("FORCE_TTS=eleven ama ELEVEN_API_KEY yok.")
 
     seen=load_seen()
     topic=pick_topic(seen)
@@ -533,18 +551,18 @@ def main():
     if not factual_ok(narration):
         log("[WARN] narration not in factual bounds; continuing.")
 
-    # images
-    images=prepare_images(img_urls)
+    # Görseller
+    images=prepare_images(img_urls, title)
 
     # TTS
     voice_mp3="voice.mp3"
     synth_tts(sentences, narration, voice_mp3, LANG)
 
-    # render
+    # Render
     res=render_video(short_title, sentences, voice_mp3, images, DURATION_TARGET, wiki_title=title.replace(" ","_"))
     log(f"[AUTOYUSON] Rendered: {res.path}")
 
-    # upload
+    # Upload (isteğe bağlı)
     if DISABLE_UPLOAD:
         log("[AUTOYUSON] Upload disabled.")
     else:
