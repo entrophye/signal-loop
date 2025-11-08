@@ -1,27 +1,34 @@
 # -*- coding: utf-8 -*-
 """
-AUTOYUSON V7.2 — Quality-First, Fail-Safe Shorts
+AUTOYUSON V7.3 — Clean Audio, Free TTS Option, Safe Music
 
-Yenilik (V7.2):
-- Müzik sağlam: AudioFileClip, hedef süreye audio_loop ile uzatılır, ardından subclip(0, duration-0.15)
-  ve fadein/fadeout uygulanır. Böylece t=duration+ε erişimi yaşanmaz (MoviePy OSError fix).
-- Diğer: V7.1 özellikleri korunur (otomatik TTS, procedural backdrop, güvenli altyazı, robust ambient generation).
+Yeniler:
+- MUSIC_MODE: default 'none' (parazitsiz). 'ambient' seçilirse çok düşük volümlü, band-limited pad üretir.
+- MUSIC_VOLUME: varsayılan 0.06 (çok düşük). İstersen 0.00–0.30 arası ayarla.
+- Ücretsiz kaliteli TTS: FORCE_TTS=edge ile Microsoft Edge TTS (neural) kullanılır (API KEY gerekmez).
+- TTS sırası (auto): eleven (varsa ve FORCE_TTS boşsa) → edge (paket varsa) → gtts.
+- ElevenLabs hâlâ destekli; token yemesin diye FORCE_TTS=edge önerilir.
 
-ENV
+ENV (özet)
   YT_CLIENT_ID, YT_CLIENT_SECRET, YT_REFRESH_TOKEN  (veya TOKEN_JSON_BASE64)
   LANGUAGE=en
   VIDEO_DURATION=55
   TITLE_PREFIX=
   TOPICS_FILE=topics.txt
-  FORCE_TTS=eleven|gtts   (opsiyonel; verilmezse auto)
-  ELEVEN_API_KEY=...      (varsa ElevenLabs kullanılır)
-  ELEVEN_VOICE=Rachel|Elli|... ya da voice_id (opsiyonel)
   PRIVACY_STATUS=public|unlisted|private
   DISABLE_UPLOAD=true|false
   IMG_MIN=1600
+  # TTS:
+  FORCE_TTS=edge|eleven|gtts   (opsiyonel; boşsa auto sıra)
+  ELEVEN_API_KEY=...           (opsiyonel)
+  ELEVEN_VOICE=Rachel|Elli|... veya voice_id (opsiyonel)
+  EDGE_TTS_VOICE=en-US-JennyNeural (opsiyonel)
+  # Müzik:
+  MUSIC_MODE=none|ambient|file (default: none)
+  MUSIC_VOLUME=0.06            (0.00–0.30)
 """
 
-import os, io, re, json, base64, random, pathlib, sys, urllib.parse, time, math, glob, subprocess
+import os, io, re, json, base64, random, pathlib, sys, urllib.parse, time, glob, subprocess
 from dataclasses import dataclass
 from typing import List, Tuple, Optional
 
@@ -29,28 +36,28 @@ import requests
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont, ImageFilter, ImageOps
 
-# --- optional deps ---
-try:
-    from gtts import gTTS
-    _HAS_GTTS=True
-except Exception:
-    _HAS_GTTS=False
+# ---- optional deps ----
+def _has_mod(name: str) -> bool:
+    try:
+        __import__(name); return True
+    except Exception:
+        return False
 
-try:
+_HAS_GTTS   = _has_mod("gtts")
+_HAS_MOVIEPY= _has_mod("moviepy")
+_HAS_GOOGLE = _has_mod("googleapiclient.discovery") and _has_mod("google.oauth2.credentials")
+_HAS_EDGE   = _has_mod("edge_tts") and _has_mod("aiofiles")
+
+if _HAS_MOVIEPY:
     from moviepy.editor import (ImageClip, AudioFileClip, CompositeVideoClip,
                                 CompositeAudioClip, afx)
-    _HAS_MOVIEPY=True
-except Exception:
-    _HAS_MOVIEPY=False
-
-try:
+if _HAS_GTTS:
+    from gtts import gTTS
+if _HAS_GOOGLE:
     from googleapiclient.discovery import build
     from googleapiclient.http import MediaFileUpload
     from google.oauth2.credentials import Credentials
     from google.auth.transport.requests import Request
-    _HAS_GOOGLE=True
-except Exception:
-    _HAS_GOOGLE=False
 
 # ---------------- Config ----------------
 LANG = (os.getenv("LANGUAGE","en").strip() or "en")[:5]
@@ -59,20 +66,28 @@ TITLE_PREFIX = os.getenv("TITLE_PREFIX","").strip()
 PRIVACY_STATUS = (os.getenv("PRIVACY_STATUS","public").strip().lower() or "public")
 DISABLE_UPLOAD = os.getenv("DISABLE_UPLOAD","").strip().lower() in ("1","true","yes")
 
-FORCE_TTS = os.getenv("FORCE_TTS","").strip().lower()  # '', 'eleven', 'gtts'
+FORCE_TTS = os.getenv("FORCE_TTS","").strip().lower()   # '', 'edge', 'eleven', 'gtts'
 ELEVEN_API_KEY = os.getenv("ELEVEN_API_KEY","").strip()
-ELEVEN_VOICE = os.getenv("ELEVEN_VOICE","").strip()    # name or voice_id
+ELEVEN_VOICE   = os.getenv("ELEVEN_VOICE","").strip()   # name or voice_id
+EDGE_TTS_VOICE = os.getenv("EDGE_TTS_VOICE","en-US-JennyNeural").strip()
 
-IMG_MIN_EDGE = int(os.getenv("IMG_MIN","1600"))
+IMG_MIN_EDGE   = int(os.getenv("IMG_MIN","1600"))
+
+MUSIC_MODE     = os.getenv("MUSIC_MODE","none").strip().lower()  # none|ambient|file
+try:
+    MUSIC_VOLUME = float(os.getenv("MUSIC_VOLUME","0.06"))
+    MUSIC_VOLUME = max(0.0, min(0.3, MUSIC_VOLUME))
+except Exception:
+    MUSIC_VOLUME = 0.06
 
 DATA = pathlib.Path("data"); DATA.mkdir(parents=True, exist_ok=True)
 SEEN = DATA/"seen_topics.json"
 FONTS = pathlib.Path("fonts"); FONTS.mkdir(parents=True, exist_ok=True)
-ASSETS = pathlib.Path("assets"); ASSETS.mkdir(parents=True, exist_ok=True)
+ASSETS= pathlib.Path("assets"); ASSETS.mkdir(parents=True, exist_ok=True)
 
 W, H = 1080, 1920
 WIKI="https://en.wikipedia.org"; REST=f"{WIKI}/api/rest_v1"; API=f"{WIKI}/w/api.php"
-UA={"User-Agent":"autoyuson-v7.2 (+github)"}
+UA={"User-Agent":"autoyuson-v7.3 (+github)"}
 DEFAULT_TAGS=["history","space","astronomy","archaeology","culture","documentary","facts","shorts"]
 CURATED_TOPICS=[
     "Rosetta Stone","Dead Sea Scrolls","Hagia Sophia","Voyager Golden Record","Terracotta Army","Göbekli Tepe",
@@ -198,9 +213,7 @@ def factual_ok(text):
     n=len(text.split()); return 80<=n<=260
 
 # --------------- Fonts/Text ---------------
-FONTS = pathlib.Path("fonts"); FONTS.mkdir(exist_ok=True)
 REG=FONTS/"NotoSans-Regular.ttf"; BLD=FONTS/"NotoSans-Bold.ttf"
-
 def ensure_fonts():
     urls={
         REG:"https://github.com/googlefonts/noto-fonts/raw/main/hinted/ttf/NotoSans/NotoSans-Regular.ttf",
@@ -331,7 +344,7 @@ def ensure_ffmpeg():
     if not which("ffmpeg"):
         raise RuntimeError("ffmpeg bulunamadı (FFMPEG gerekli).")
 
-# --------------- TTS (auto + override) ----
+# --------------- TTS providers ------------
 ELEVEN_API="https://api.elevenlabs.io/v1"
 
 def eleven_fetch_voices():
@@ -349,10 +362,8 @@ def eleven_resolve_voice_id(value: str) -> str:
         return by_name[val]
     prefer=["Rachel","Bella","Adam","Antoni","Elli","Brian","Sam"]
     for p in prefer:
-        if p in by_name:
-            return by_name[p]
-    if by_name:
-        return list(by_name.values())[0]
+        if p in by_name: return by_name[p]
+    if by_name: return list(by_name.values())[0]
     raise RuntimeError("ElevenLabs: hesapta hiç voice yok.")
 
 def tts_eleven(sentences, out_mp3, voice_value):
@@ -384,8 +395,38 @@ def tts_eleven(sentences, out_mp3, voice_value):
     try: os.remove(lst)
     except: pass
 
+# --- Edge TTS (free) ---
+async def _edge_ssml_async(sentences, outpath, voice):
+    import edge_tts, aiofiles
+    ssml = "<speak version='1.0' xml:lang='en-US'><voice name='{v}'><mstts:express-as style='narration-relaxed'>".format(v=voice)
+    for i,s in enumerate(sentences):
+        br = "300ms" if i in (0,1) else "200ms"
+        txt = (s.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;"))
+        ssml += f"<p>{txt}</p><break time='{br}'/>"
+    ssml += "</mstts:express-as></voice></speak>"
+    comm = edge_tts.Communicate(ssml, voice=voice)
+    async with aiofiles.open(outpath,"wb") as f:
+        async for ch in comm.stream():
+            if ch["type"]=="audio":
+                await f.write(ch["data"])
+
+def tts_edge(sentences, out_mp3, voice):
+    import asyncio
+    try:
+        try: loop=asyncio.get_event_loop()
+        except RuntimeError:
+            asyncio.set_event_loop(asyncio.new_event_loop()); loop=asyncio.get_event_loop()
+        loop.run_until_complete(_edge_ssml_async(sentences, out_mp3, voice))
+        # biraz yavaşlat
+        slowed="tmp_slow.mp3"
+        subprocess.run(["ffmpeg","-y","-i",out_mp3,"-filter:a","atempo=0.94",slowed],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        os.replace(slowed,out_mp3)
+    except Exception as e:
+        raise RuntimeError(f"Edge TTS failed: {e}")
+
 def tts_gtts(narration, out_mp3, lang):
-    if not _HAS_GTTS: raise RuntimeError("gTTS yok; ELEVEN_API_KEY sağlamalısın veya gTTS yüklemelisin.")
+    if not _HAS_GTTS: raise RuntimeError("gTTS yok.")
     gTTS(text=narration,lang=lang,tld="com").save(out_mp3)
     slowed="tmp_slow.mp3"
     subprocess.run(["ffmpeg","-y","-i",out_mp3,"-filter:a","atempo=0.92",slowed],
@@ -393,33 +434,41 @@ def tts_gtts(narration, out_mp3, lang):
     os.replace(slowed,out_mp3)
 
 def choose_tts_provider()->str:
-    if FORCE_TTS in ("eleven","gtts"):
+    if FORCE_TTS in ("edge","eleven","gtts"):
         return FORCE_TTS
-    return "eleven" if ELEVEN_API_KEY else "gtts"
+    # auto sıra: eleven → edge → gtts
+    if ELEVEN_API_KEY: return "eleven"
+    if _HAS_EDGE: return "edge"
+    if _HAS_GTTS: return "gtts"
+    return "gtts"  # son çare
 
 def synth_tts(sentences, narration, out_mp3, lang):
-    provider=choose_tts_provider()
-    log(f"[TTS] Provider={provider} (FORCE_TTS={'-' if not FORCE_TTS else FORCE_TTS}; ELEVEN={'yes' if ELEVEN_API_KEY else 'no'}; GTTS={'yes' if _HAS_GTTS else 'no'})")
-    if provider=="eleven":
+    prov=choose_tts_provider()
+    log(f"[TTS] Provider={prov} (ELEVEN={'yes' if ELEVEN_API_KEY else 'no'}; EDGE={'yes' if _HAS_EDGE else 'no'}; GTTS={'yes' if _HAS_GTTS else 'no'})")
+    if prov=="eleven":
         if not ELEVEN_API_KEY: raise RuntimeError("ElevenLabs için ELEVEN_API_KEY gerekli.")
         tts_eleven(sentences, out_mp3, ELEVEN_VOICE or "")
+    elif prov=="edge":
+        if not _HAS_EDGE: raise RuntimeError("edge-tts/aiofiles kurulu değil.")
+        tts_edge(sentences, out_mp3, EDGE_TTS_VOICE or "en-US-JennyNeural")
     else:
         tts_gtts(narration, out_mp3, lang)
 
-# --------------- Subtitles -----------------
+# --------------- Subs ----------------------
 def alloc_subs(sentences, voice_duration):
     weights=[max(25,len(s)) for s in sentences]
-    total=sum(weights); budget=voice_duration*0.92
+    total=sum(weights) or 1
+    budget=voice_duration*0.92
     t=voice_duration*0.04
     out=[]
     for s in sentences:
         chunk=budget*(max(25,len(s))/total)
         chunk=max(2.0, min(5.0, chunk))
-        start=t; end=min(voice_duration-0.25, start+chunk)  # 0.25s güvenli marj
+        start=t; end=min(voice_duration-0.25, start+chunk)
         out.append((s,start,end)); t=end
     return out
 
-# --------------- Music (robust) -----------
+# --------------- Music (very clean) -------
 def _run_ffmpeg(cmd:list)->bool:
     try:
         r=subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -428,34 +477,25 @@ def _run_ffmpeg(cmd:list)->bool:
         return False
 
 def gen_ambient_music(out_path:str, duration_sec:float)->Optional[str]:
+    """Band-limited, düşük gain ambient. Hiss/parazit minimize."""
     ensure_ffmpeg()
     dur=max(10,int(duration_sec))
-    # A) pad+noise
-    cmdA=["ffmpeg","-y","-filter_complex",
-          ("aevalsrc=0|0[s0];"
-           "sine=d=0.1:f=220,afade=t=in:st=0:d=0.6,aloop=loop=-1:size=22050:start=0,atrim=0:{d},asetpts=N/SR/TB,volume=0.25[sine];"
-           "anoisesrc=d={d}:color=pink:amplitude=0.02[noi];"
-           "[sine][noi]amix=inputs=2:normalize=0,lowpass=f=4000,areverb=10:10:50:0.5:0.5:0.3,volume=0.9[aout]").format(d=dur),
-          "-map","[aout]","-t",str(dur), out_path]
-    if _run_ffmpeg(cmdA) and os.path.exists(out_path) and os.path.getsize(out_path)>0:
-        log("[MUSIC] ambient generated (pad+noise)"); return out_path
-    # B) noise only
-    cmdB=["ffmpeg","-y","-f","lavfi","-i",f"anoisesrc=d={dur}:color=pink:amplitude=0.015",
-          "-af","lowpass=f=3500,volume=0.9","-t",str(dur), out_path]
-    if _run_ffmpeg(cmdB) and os.path.exists(out_path) and os.path.getsize(out_path)>0:
-        log("[MUSIC] ambient generated (noise only)"); return out_path
-    # C) silence
-    cmdC=["ffmpeg","-y","-f","lavfi","-i","anullsrc=r=44100:cl=mono","-t",str(dur), out_path]
-    if _run_ffmpeg(cmdC) and os.path.exists(out_path) and os.path.getsize(out_path)>0:
+    # düşük gain pink noise + yumuşak LPF + hafif reverb
+    cmd=["ffmpeg","-y","-f","lavfi","-i",f"anoisesrc=d={dur}:color=pink:amplitude=0.008",
+         "-af","lowpass=f=2800,highpass=f=120,areverb=8:8:40:0.5:0.5:0.2,volume=0.6",
+         "-t",str(dur), out_path]
+    if _run_ffmpeg(cmd) and os.path.exists(out_path) and os.path.getsize(out_path)>0:
+        log("[MUSIC] ambient generated (clean pink)"); return out_path
+    # fallback: sessizlik
+    cmd2=["ffmpeg","-y","-f","lavfi","-i","anullsrc=r=44100:cl=mono","-t",str(dur), out_path]
+    if _run_ffmpeg(cmd2) and os.path.exists(out_path) and os.path.getsize(out_path)>0:
         log("[MUSIC] ambient generated (silence)"); return out_path
-    log("[MUSIC] ambient generation failed — proceeding without music.")
     try:
-        if os.path.exists(out_path) and os.path.getsize(out_path)==0:
-            os.remove(out_path)
+        if os.path.exists(out_path) and os.path.getsize(out_path)==0: os.remove(out_path)
     except: pass
     return None
 
-def pick_music()->Optional[str]:
+def pick_music_file()->Optional[str]:
     files=glob.glob(str(ASSETS/"music" / "*.mp3"))
     return random.choice(files) if files else None
 
@@ -530,28 +570,29 @@ def render_video(title, sentences, narration_mp3, images, duration_hint, wiki_ti
         save_text(txt, fn, width=W-220, fontsize=36, bold=False)
         subs.append(ImageClip(fn).set_start(s).set_duration(e-s).set_position(("center",H-340)).fadein(0.10).fadeout(0.10))
 
-    # --- Music: loop + safe trim ---
-    music_path = pick_music()
-    if not music_path:
+    # --- MUSIC ---
+    audio_layers=[voice.set_start(0)]
+    music_path=None
+    if MUSIC_MODE=="file":
+        music_path = pick_music_file()
+        if not music_path: log("[MUSIC] file mode seçildi ama assets/music boş; müziksiz devam.")
+    elif MUSIC_MODE=="ambient":
         music_path = str(DATA/"ambient_autogen.mp3")
         produced = gen_ambient_music(music_path, duration)
-        if not produced:
-            music_path = None  # üretilemediyse müziksiz
+        if not produced: music_path=None
+    else:
+        log("[MUSIC] mode=none (temiz arka plan)")
 
-    audio_layers=[voice.set_start(0)]
     if music_path and os.path.exists(music_path) and os.path.getsize(music_path)>0:
         try:
             m = AudioFileClip(music_path)
-            # hedefe kadar uzat, sonra güvenli kırp
             if (m.duration or 0) < (duration - 0.05):
                 m = m.fx(afx.audio_loop, duration=duration+0.5)
-            m = m.subclip(0, max(0.0, duration-0.15)).volumex(0.12).audio_fadein(0.8).audio_fadeout(1.0)
+            m = m.subclip(0, max(0.0, duration-0.15)).volumex(MUSIC_VOLUME).audio_fadein(0.6).audio_fadeout(0.8)
             audio_layers.append(m.set_start(0))
-            log(f"[MUSIC] using: {music_path} (looped/trimmed)")
+            log(f"[MUSIC] using: {music_path} (mode={MUSIC_MODE}, vol={MUSIC_VOLUME:.2f})")
         except Exception as e:
-            log(f"[MUSIC] failed to load, proceeding without music: {e}")
-    else:
-        log("[MUSIC] no music file present; proceeding without music")
+            log(f"[MUSIC] failed, continue without: {e}")
 
     comp_audio=CompositeAudioClip([a.fx(afx.audio_normalize) for a in audio_layers]).set_duration(duration-0.05)
     comp=(CompositeVideoClip([broll, title_clip, *subs]).set_audio(comp_audio).set_duration(duration))
