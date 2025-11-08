@@ -1,22 +1,21 @@
 # -*- coding: utf-8 -*-
 """
 AUTOYUSON — Cinematic Factual Shorts (History / Space / Culture)
+V4 — clean rewrite
 
-V3 (fixed/robust) — Güncel farklar:
-- Beat sheet metin: cold open → hook → 3 fact → close
-- Edge-TTS + SSML (narration-relaxed, rate -3%, pitch -2%), yoksa gTTS fallback
-- Pydub mastering: HPF 120 Hz, LPF 8 kHz, hafif kompresyon, normalize
-- Ambiyans + otomatik ducking (yoksa sessizce atla)
-- Görsel sinema dokusu: Ken Burns, crossfade, warm grade, vignette (boyuta göre), film-grain
-- Mini-chunk kelime senkron altyazı (edge_tts varsa); yoksa süre bazlı fallback
-- Font indirme/ölçek güvenliği, başlık sanitizasyonu
-- Upload opsiyonel: DISABLE_UPLOAD=true ise video sadece diske yazılır
-- PRİVACY_STATUS env ile public/unlisted/private seçimi
-- ValueError/shape hatalarına karşı görsel akışında ek kontroller
+Öne Çıkanlar (V4):
+- TTS SAĞLAYICI KONTROLÜ: FORCE_TTS=edge|gtts (zorunlu kıl & logla)
+- SSML DİKKAT ÇEKTİR: styledegree=1.2, rate -12%, pitch -4%, vurgulu prosody, uzun durak
+- NET LOG: Hangi TTS kullanıldı, fallback oldu mu, timings üretildi mi
+- MASTERING YUMUŞAK: HPF 100 Hz, LPF 9 kHz, hafif kompres, normalize; DISABLE_MASTERING ile kapatılabilir
+- RENDER HIZI: ffmpeg_params -> -crf 25 -preset veryfast -pix_fmt yuv420p
+- DİRENÇLİ: edge_tts yoksa gTTS’e geç, fonts/assets cache friendly, görsel boyutlarına duyarlı vignette/grain
+- UPLOAD OPSİYONEL: DISABLE_UPLOAD=true ile devre dışı
+- PRİVACY_STATUS env: public|unlisted|private
 
 ENV (GitHub Secrets veya local):
   YT_CLIENT_ID, YT_CLIENT_SECRET, YT_REFRESH_TOKEN
-  (veya TOKEN_JSON_BASE64 içinde refresh_token + client_id + client_secret)
+  (veya TOKEN_JSON_BASE64: refresh_token+client_id+client_secret)
 
 Opsiyonel:
   LANGUAGE=en
@@ -24,19 +23,17 @@ Opsiyonel:
   TITLE_PREFIX=
   TOPICS_FILE=topics.txt
   EDGE_TTS_VOICE=en-US-JennyNeural
-  PRIVACY_STATUS=public  (public|unlisted|private)
-  DISABLE_UPLOAD=true     (true/1 ise upload yapılmaz)
-
-Assets:
-  assets/ambience.mp3  (varsa otomatik ducking)
-  fonts/ (NotoSans indirilecek; yoksa default font)
+  PRIVACY_STATUS=public
+  DISABLE_UPLOAD=true
+  FORCE_TTS=edge|gtts
+  DISABLE_MASTERING=true
 """
 
 import os, io, re, json, base64, random, pathlib, sys, asyncio, urllib.parse, math, time
 from typing import List, Tuple, Optional
 from dataclasses import dataclass
 
-# --- 3rd-party (opsiyonel mevcutsa tam güç, yoksa bazı parçalar fallback) ---
+# --- 3rd-party (opsiyonel mevcutsa tam; yoksa fallback) ---
 import requests
 import numpy as np
 
@@ -55,7 +52,6 @@ except Exception:
 try:
     from moviepy.editor import (ImageClip, AudioFileClip, CompositeVideoClip,
                                 CompositeAudioClip, afx)
-    from moviepy.video.fx.all import resize as mp_resize
     _HAS_MOVIEPY = True
 except Exception:
     _HAS_MOVIEPY = False
@@ -85,10 +81,12 @@ LANG = (os.getenv("LANGUAGE", "en").strip() or "en")[:5]
 DURATION_TARGET = int(os.getenv("VIDEO_DURATION", "55"))
 TITLE_PREFIX = os.getenv("TITLE_PREFIX", "").strip()
 PRIVACY_STATUS = os.getenv("PRIVACY_STATUS", "public").strip().lower() or "public"
-DISABLE_UPLOAD = os.getenv("DISABLE_UPLOAD", "").strip().lower() in ("1", "true", "yes")
+DISABLE_UPLOAD = os.getenv("DISABLE_UPLOAD", "").strip().lower() in ("1","true","yes")
+FORCE_TTS = os.getenv("FORCE_TTS","").strip().lower()  # '', 'edge', 'gtts'
+DISABLE_MASTERING = os.getenv("DISABLE_MASTERING","").strip().lower() in ("1","true","yes")
 
 YOUTUBE_CATEGORY_ID = "27"
-DEFAULT_TAGS = ["history", "space", "astronomy", "archaeology", "culture", "documentary", "facts", "shorts"]
+DEFAULT_TAGS = ["history","space","astronomy","archaeology","culture","documentary","facts","shorts"]
 TOPICS_FILE = os.getenv("TOPICS_FILE", "topics.txt")
 EDGE_TTS_VOICE = os.getenv("EDGE_TTS_VOICE", "en-US-JennyNeural")
 
@@ -101,7 +99,7 @@ W, H = 1080, 1920
 WIKI = "https://en.wikipedia.org"
 REST = f"{WIKI}/api/rest_v1"
 API  = f"{WIKI}/w/api.php"
-UA = {"User-Agent": "autoyuson-bot/1.3 (+github)"}
+UA = {"User-Agent": "autoyuson-bot/1.4 (+github)"}
 
 CURATED_TOPICS = [
     "Rosetta Stone","Dead Sea Scrolls","Hagia Sophia","Voyager Golden Record","Terracotta Army","Göbekli Tepe",
@@ -145,7 +143,7 @@ def pick_topic(seen: List[str]) -> str:
             return t
     return random.choice(pool) if pool else "Göbekli Tepe"
 
-# ---------- Wikipedia (REST) ----------
+# ---------- Wikipedia ----------
 def _rest_summary(title: str):
     url = f"{REST}/page/summary/{urllib.parse.quote(title)}"
     try:
@@ -216,7 +214,7 @@ def download_image(url: str) -> Optional[Image.Image]:
     except Exception:
         return None
 
-# ---------- Script (Beat Sheet) ----------
+# ---------- Script ----------
 def craft_script(title: str, summary: str):
     clean = re.sub(r"\s+"," ", summary).strip()
     cold_open = f"{title}. Verified, preserved, undeniable."
@@ -250,7 +248,6 @@ def ensure_fonts():
                 r=requests.get(u,headers=UA,timeout=30); r.raise_for_status()
                 p.write_bytes(r.content)
             except Exception:
-                # font indirilemezse default font kullanılacak
                 pass
 
 def _textsize(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFont):
@@ -301,10 +298,10 @@ def save_text_box(text,out_path,width,fontsize,bold=False):
     img.save(out_path,"PNG")
 
 # ---------- TTS + timings ----------
-SSML_TMPL = """<speak version="1.0" xml:lang="en-US">
+SSML_TMPL = """<speak version="1.0" xml:lang="en-US" xmlns:mstts="https://www.w3.org/2001/mstts">
   <voice name="{voice}">
-    <mstts:express-as style="narration-relaxed">
-      <prosody rate="-3%" pitch="-2%">{payload}</prosody>
+    <mstts:express-as style="narration-relaxed" styledegree="1.2">
+      <prosody rate="-12%" pitch="-4%">{payload}</prosody>
     </mstts:express-as>
   </voice>
 </speak>"""
@@ -313,12 +310,11 @@ def sentences_to_ssml(sents:List[str])->str:
     parts=[]
     for i,s in enumerate(sents):
         s=(s.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;"))
-        br="300ms" if i in (0,1) else "180ms"
-        parts.append(f"<p>{s}</p><break time=\"{br}\"/>")
+        br="420ms" if i in (0,1) else "240ms"
+        parts.append(f"<p><prosody volume='+2dB'>{s}</prosody></p><break time=\"{br}\"/>")
     return "".join(parts)
 
 async def edge_ssml_async(sentences:List[str], outpath:str, voice:str):
-    # edge_tts ve aiofiles importları fonksiyon içinde (opsiyonel)
     import importlib
     edge_tts = importlib.import_module("edge_tts")
     aiofiles = importlib.import_module("aiofiles")
@@ -344,50 +340,61 @@ async def edge_ssml_async(sentences:List[str], outpath:str, voice:str):
     return out
 
 def tts_with_timings(sentences:List[str], narration:str, outpath:str, lang:str, voice:str):
-    # Edge-TTS varsa kullan, yoksa gTTS'e düş
-    try:
-        # event loop yönetimi (Actions/Windows uyumlu)
-        try:
-            loop = asyncio.get_event_loop()
-        except RuntimeError:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-        t=loop.run_until_complete(edge_ssml_async(sentences,outpath,voice))
-        if t:
-            return t
-    except Exception:
-        pass
-    if not _HAS_GTTS:
-        raise RuntimeError("TTS başarısız: edge_tts bulunamadı ve gTTS yüklü değil.")
-    gTTS(text=narration,lang=lang,tld="com").save(outpath)
-    return []
+    print(f"[TTS] Requested voice={voice} lang={lang} FORCE_TTS={FORCE_TTS or '-'}")
 
-# ---------- Mastering (pydub) ----------
+    # edge yolu
+    if FORCE_TTS in ("","edge"):
+        try:
+            try:
+                loop = asyncio.get_event_loop()
+            except RuntimeError:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+            t = loop.run_until_complete(edge_ssml_async(sentences,outpath,voice))
+            print(f"[TTS] Provider=edge-tts timings={'yes' if t else 'no'}")
+            if t:
+                return t
+        except Exception as e:
+            if FORCE_TTS == "edge":
+                raise RuntimeError(f"Edge-TTS ZORUNLU idi ve hata: {e}")
+            print(f"[TTS] Edge-TTS failed, will try gTTS: {e}")
+
+    # gTTS fallback
+    if FORCE_TTS in ("","gtts"):
+        if not _HAS_GTTS:
+            raise RuntimeError("TTS başarısız: edge_tts yok/gTTS yok.")
+        gTTS(text=narration, lang=lang, tld="com").save(outpath)
+        print("[TTS] Provider=gTTS (fallback)")
+        return []
+
+    raise RuntimeError("FORCE_TTS geçersiz. edge|gtts kullan.")
+
+# ---------- Mastering ----------
 def master_voice(in_mp3:str, out_mp3:str):
+    if DISABLE_MASTERING:
+        import shutil; shutil.copyfile(in_mp3, out_mp3); print("[AUDIO] Mastering disabled."); return
     if not _HAS_PYDUB:
-        # Pydub yoksa ham dosyayı aynen kullan (MoviePy normalize edecek)
-        import shutil; shutil.copyfile(in_mp3, out_mp3); return
+        import shutil; shutil.copyfile(in_mp3, out_mp3); print("[AUDIO] Pydub yok; raw passed."); return
+
+    print("[AUDIO] Mastering: HPF100 + LPF9k + soft comp + normalize")
     voice=AudioSegment.from_file(in_mp3)
-    soft=voice.low_pass_filter(9000)
-    voice=soft.high_pass_filter(120).low_pass_filter(8000)
-    voice=effects.compress_dynamic_range(voice, threshold=-18.0, ratio=2.0, attack=5, release=50)
-    # normalize hedefi: ~-14 LUFS civarı için headroom ~14 dB
+    # daha yumuşak karakter: hafif EQ
+    voice=voice.high_pass_filter(100).low_pass_filter(9000)
+    # hafif kompres (farkı öldürmesin)
+    voice=effects.compress_dynamic_range(voice, threshold=-16.0, ratio=1.6, attack=8, release=120)
+    # normalize (yaklaşık -14 LUFS headroom)
     voice=effects.normalize(voice, headroom=14.0)
     voice.export(out_mp3, format="mp3")
 
 def duck_ambience(narration_path:str, ambience_path:str, out_path:str,
                   up_gain_db=-13.0, down_gain_db=-18.0):
     if not _HAS_PYDUB:
-        # pydub yoksa, sadece ambience'ı sabit düşük volümde ver
-        amb = AudioSegment.from_file(ambience_path) if _HAS_PYDUB else None
         import shutil; shutil.copyfile(ambience_path, out_path); return
     nar=AudioSegment.from_file(narration_path)
     amb=AudioSegment.from_file(ambience_path)
     if len(amb)<len(nar):
-        amb=amb*int(math.ceil(len(nar)/len(amb)))
-        amb=amb[:len(nar)]
-    window=50
-    mixed=[]
+        amb=amb*int(math.ceil(len(nar)/len(amb))); amb=amb[:len(nar)]
+    window=50; mixed=[]
     for i in range(0, len(nar), window):
         sl = nar[i:i+window]
         slice_db = sl.dBFS if sl.rms>0 else -90
@@ -410,31 +417,27 @@ def fit_center_crop(img: Image.Image, w=W, h=H) -> Image.Image:
     return img.crop((L,T,L+w,T+h))
 
 def apply_grade(img: Image.Image) -> Image.Image:
-    """Sıcak renk derecelendirme + vinyet + grain (görsel boyutuna bağlı)."""
     w,h = img.size
     graded = ImageOps.colorize(ImageOps.grayscale(img), black="#0b0b0b", white="#f2e8da").convert("RGB")
     graded = Image.blend(img, graded, 0.18)
-
-    # Vinyet maskesi (merkez açık, kenarlar koyu)
+    # vignette
     mask = Image.new("L", (w, h), 160)
     draw = ImageDraw.Draw(mask)
     margin = int(min(w, h) * 0.30)
     draw.ellipse((margin, margin, w - margin, h - margin), fill=0)
     mask = mask.filter(ImageFilter.GaussianBlur(80))
-
-    # Overlay
-    overlay = Image.new("RGBA", (w, h), (0, 0, 0, 255))
-    overlay.putalpha(mask)
+    overlay = Image.new("RGBA", (w, h), (0, 0, 0, 255)); overlay.putalpha(mask)
     base = graded.convert("RGBA")
     with_vignette = Image.alpha_composite(base, overlay).convert("RGB")
-
-    # Film grain
+    # grain
     noise = (np.random.randn(h, w) * 6).clip(-12, 12).astype(np.int16)
     arr = np.array(with_vignette).astype(np.int16)
     arr = np.clip(arr + noise[:, :, None], 0, 255).astype(np.uint8)
     return Image.fromarray(arr)
 
 def ken_burns_clip(img: Image.Image, duration: float, z0=1.05, z1=1.12):
+    if not _HAS_MOVIEPY:
+        raise RuntimeError("MoviePy yok.")
     base = fit_center_crop(apply_grade(img), W, H)
     path=f"kb_{int(time.time()*1000)}.jpg"
     base.save(path,quality=92)
@@ -442,22 +445,22 @@ def ken_burns_clip(img: Image.Image, duration: float, z0=1.05, z1=1.12):
     return clip.resize(lambda t: z0+(z1-z0)*(t/duration)).set_position(("center","center"))
 
 def build_broll(images:List[Image.Image], duration:float):
+    if not _HAS_MOVIEPY:
+        raise RuntimeError("MoviePy yok.")
     if not images:
         images=[Image.new("RGB",(W,H),(20,20,24))]
     if len(images)==1:
         return ken_burns_clip(images[0], duration)
-    per=max(3.6, min(7.8, duration/len(images))); fc=0.6
+    per=max(3.6, min(7.8, duration/len(images))); fc=0.5
     layers=[]; t=0.0
     for im in images:
         c=ken_burns_clip(im, per).set_start(t).crossfadein(fc).crossfadeout(fc)
-        layers.append(c)
-        t+= per - fc
+        layers.append(c); t+= per - fc
     return CompositeVideoClip(layers).set_duration(duration)
 
 # ---------- Subtitles ----------
 def group_boundaries(bound:List[Tuple[str,float,float]], dur:float)->List[Tuple[str,float,float]]:
-    if not bound:
-        return []
+    if not bound: return []
     chunks=[]; buf=[]
     for w,s,e in bound:
         if not buf:
@@ -465,11 +468,8 @@ def group_boundaries(bound:List[Tuple[str,float,float]], dur:float)->List[Tuple[
         elif len(buf)<3 and (e-buf[0][1])<1.1:
             buf.append((w,s,e))
         else:
-            txt=" ".join(x[0] for x in buf)
-            chunks.append((txt, buf[0][1], buf[-1][2]))
-            buf=[(w,s,e)]
-    if buf:
-        chunks.append((" ".join(x[0] for x in buf), buf[0][1], buf[-1][2]))
+            txt=" ".join(x[0] for x in buf); chunks.append((txt, buf[0][1], buf[-1][2])); buf=[(w,s,e)]
+    if buf: chunks.append((" ".join(x[0] for x in buf), buf[0][1], buf[-1][2]))
     out=[]
     for t,s,e in chunks:
         s=max(0.55,min(s,dur-0.3)); e=max(s+0.12,min(e,dur-0.2)); out.append((t,s,e))
@@ -477,8 +477,7 @@ def group_boundaries(bound:List[Tuple[str,float,float]], dur:float)->List[Tuple[
 
 def fallback_chunks(text:str, dur:float)->List[Tuple[str,float,float]]:
     words=re.findall(r"\S+", text); n=max(1,len(words))
-    avg=max(0.18, min(0.24, dur/(n+6))); t=0.6; out=[]
-    buf=[]; cnt=0
+    avg=max(0.18, min(0.24, dur/(n+6))); t=0.6; out=[]; buf=[]; cnt=0
     for w in words:
         buf.append(w); cnt+=1
         if cnt==3:
@@ -497,7 +496,7 @@ def render(title:str, narration:str, sentences:List[str],
            audio_path:str, boundaries:List[Tuple[str,float,float]],
            images:List[Image.Image], duration_hint:int, wiki_title_url:str)->RenderResult:
     if not _HAS_MOVIEPY:
-        raise RuntimeError("MoviePy bulunamadı. Lütfen moviepy kurun.")
+        raise RuntimeError("MoviePy bulunamadı.")
     ensure_fonts()
 
     voice = AudioFileClip(audio_path)
@@ -538,24 +537,29 @@ def render(title:str, narration:str, sentences:List[str],
             duck_ambience(mastered if pathlib.Path(mastered).exists() else audio_path, amb_path, ducked)
             amb_clip = AudioFileClip(ducked)
         except Exception:
-            amb_clip = AudioFileClip(amb_path).volumex(0.14)
+            from moviepy.editor import AudioFileClip as AFC
+            amb_clip = AFC(amb_path).volumex(0.14)
         audio_layers.append(amb_clip.set_duration(duration))
 
     comp_audio=CompositeAudioClip([a.fx(afx.audio_normalize) for a in audio_layers])
-    comp = CompositeVideoClip([broll, title_clip, *subs]).set_audio(comp_audio).set_duration(duration)
+    comp = (CompositeVideoClip([broll, title_clip, *subs])
+            .set_audio(comp_audio)
+            .set_duration(duration))
 
     # Dosya adı güvenli
     out = re.sub(r"[^-\w\s.,()]+","",title).strip().replace(" ","_")[:80] or "autoyuson_video"
     out_path=f"{out}.mp4"
-    comp.write_videofile(out_path, fps=30, codec="libx264", audio_codec="aac",
-                         temp_audiofile="temp-audio.m4a", remove_temp=True, threads=4, verbose=False, logger=None)
+    comp.write_videofile(
+        out_path, fps=30, codec="libx264", audio_codec="aac",
+        temp_audiofile="temp-audio.m4a", remove_temp=True, threads=4, verbose=False, logger=None,
+        ffmpeg_params=["-crf","25","-preset","veryfast","-pix_fmt","yuv420p"]
+    )
 
     # Temizlik (PNG'ler)
     try:
         os.remove(title_png)
         for f in sub_pngs:
-            if os.path.exists(f):
-                os.remove(f)
+            if os.path.exists(f): os.remove(f)
     except Exception:
         pass
 
@@ -584,7 +588,7 @@ def _read_oauth():
 
 def build_youtube():
     if not _HAS_GOOGLE:
-        raise RuntimeError("Google API client kütüphaneleri kurulu değil.")
+        raise RuntimeError("Google API client yok.")
     cid,cs,rt=_read_oauth()
     if not (cid and cs and rt):
         raise RuntimeError("YouTube OAuth secrets missing.")
@@ -608,8 +612,8 @@ def upload_youtube(path:str,title:str,desc:str,tags:List[str],cat="27",privacy="
 
 # ---------- Orchestrator ----------
 @dataclass
-class OrchestrateResult:
-    path:str; video_id:Optional[str]; title:str
+class RenderPack:
+    path:str; title:str; desc:str; tags:List[str]; video_id:Optional[str]
 
 def main()->int:
     seen=load_seen()
@@ -619,7 +623,7 @@ def main()->int:
     title, summary, page_url, img_urls = wiki_fetch(topic)
     narration, short_title, sentences = craft_script(title, summary)
     if not is_factual(narration):
-        print("[AUTOYUSON] Warning: Narration length or markers outside factual range; continuing.")
+        print("[AUTOYUSON] Warn: narration out of factual bounds; continue.")
 
     # Görseller
     imgs=[]
@@ -635,14 +639,18 @@ def main()->int:
     voice_path="voice.mp3"
     boundaries = tts_with_timings(sentences, narration, voice_path, LANG, EDGE_TTS_VOICE)
 
+    # Mastering (yumuşak) + ambience duck
+    mastered="voice_mastered.mp3"
+    master_voice(voice_path, mastered)
+
     # Render
-    result=render(short_title, narration, sentences, voice_path, boundaries, imgs, DURATION_TARGET, wiki_title_url=title.replace(" ","_"))
+    result=render(short_title, narration, sentences, mastered, boundaries, imgs, DURATION_TARGET, wiki_title_url=title.replace(" ","_"))
     print(f"[AUTOYUSON] Rendered: {result.video_path}")
 
-    # Upload (opsiyonel)
+    # Upload opsiyonel
+    vid=None
     if DISABLE_UPLOAD:
         print("[AUTOYUSON] Upload disabled (DISABLE_UPLOAD=true).")
-        vid=None
     else:
         try:
             print("[AUTOYUSON] Uploading…")
