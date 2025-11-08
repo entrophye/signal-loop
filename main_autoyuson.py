@@ -1,18 +1,24 @@
 # -*- coding: utf-8 -*-
 """
-AUTOYUSON V7.1 — Quality-First, Fail-Safe Shorts
+AUTOYUSON V7.2 — Quality-First, Fail-Safe Shorts
 
-Değişiklikler (V7.1):
-- Ambient müzik üretimi sağlamlaştırıldı (3 aşamalı fallback + yoksa sessizlik + son çare müziksiz).
-- Render, müzik dosyası gerçekten yoksa müziksiz devam ediyor (crash yok).
+Yenilik (V7.2):
+- Müzik sağlam: AudioFileClip, hedef süreye audio_loop ile uzatılır, ardından subclip(0, duration-0.15)
+  ve fadein/fadeout uygulanır. Böylece t=duration+ε erişimi yaşanmaz (MoviePy OSError fix).
+- Diğer: V7.1 özellikleri korunur (otomatik TTS, procedural backdrop, güvenli altyazı, robust ambient generation).
 
-Genel:
-- TTS: Auto (ELEVEN varsa ElevenLabs, yoksa gTTS) veya FORCE_TTS=eleven|gtts
-- Eleven voice: isim veya voice_id; bulunamazsa akıllı seçim
-- Tempo: atempo=0.92 + cümle arası 320ms sessizlik
-- Altyazı: min 2.0s / max 5.0s, konuşma süresine oranlı
-- Görsel: Wikimedia hi-res (IMG_MIN) yoksa procedural sinematik
-- Encode: CRF 20, preset medium, yuv420p
+ENV
+  YT_CLIENT_ID, YT_CLIENT_SECRET, YT_REFRESH_TOKEN  (veya TOKEN_JSON_BASE64)
+  LANGUAGE=en
+  VIDEO_DURATION=55
+  TITLE_PREFIX=
+  TOPICS_FILE=topics.txt
+  FORCE_TTS=eleven|gtts   (opsiyonel; verilmezse auto)
+  ELEVEN_API_KEY=...      (varsa ElevenLabs kullanılır)
+  ELEVEN_VOICE=Rachel|Elli|... ya da voice_id (opsiyonel)
+  PRIVACY_STATUS=public|unlisted|private
+  DISABLE_UPLOAD=true|false
+  IMG_MIN=1600
 """
 
 import os, io, re, json, base64, random, pathlib, sys, urllib.parse, time, math, glob, subprocess
@@ -66,7 +72,7 @@ ASSETS = pathlib.Path("assets"); ASSETS.mkdir(parents=True, exist_ok=True)
 
 W, H = 1080, 1920
 WIKI="https://en.wikipedia.org"; REST=f"{WIKI}/api/rest_v1"; API=f"{WIKI}/w/api.php"
-UA={"User-Agent":"autoyuson-v7.1 (+github)"}
+UA={"User-Agent":"autoyuson-v7.2 (+github)"}
 DEFAULT_TAGS=["history","space","astronomy","archaeology","culture","documentary","facts","shorts"]
 CURATED_TOPICS=[
     "Rosetta Stone","Dead Sea Scrolls","Hagia Sophia","Voyager Golden Record","Terracotta Army","Göbekli Tepe",
@@ -192,7 +198,9 @@ def factual_ok(text):
     n=len(text.split()); return 80<=n<=260
 
 # --------------- Fonts/Text ---------------
+FONTS = pathlib.Path("fonts"); FONTS.mkdir(exist_ok=True)
 REG=FONTS/"NotoSans-Regular.ttf"; BLD=FONTS/"NotoSans-Bold.ttf"
+
 def ensure_fonts():
     urls={
         REG:"https://github.com/googlefonts/noto-fonts/raw/main/hinted/ttf/NotoSans/NotoSans-Regular.ttf",
@@ -407,7 +415,7 @@ def alloc_subs(sentences, voice_duration):
     for s in sentences:
         chunk=budget*(max(25,len(s))/total)
         chunk=max(2.0, min(5.0, chunk))
-        start=t; end=min(voice_duration-0.2, start+chunk)
+        start=t; end=min(voice_duration-0.25, start+chunk)  # 0.25s güvenli marj
         out.append((s,start,end)); t=end
     return out
 
@@ -420,16 +428,9 @@ def _run_ffmpeg(cmd:list)->bool:
         return False
 
 def gen_ambient_music(out_path:str, duration_sec:float)->Optional[str]:
-    """
-    3 aşamalı üretim:
-      A) sine+pink noise + reverb + lowpass
-      B) sadece pink noise + lowpass
-      C) tam sessizlik
-    Sonunda dosya varsa path döner; yoksa None.
-    """
     ensure_ffmpeg()
     dur=max(10,int(duration_sec))
-    # A) karma pad
+    # A) pad+noise
     cmdA=["ffmpeg","-y","-filter_complex",
           ("aevalsrc=0|0[s0];"
            "sine=d=0.1:f=220,afade=t=in:st=0:d=0.6,aloop=loop=-1:size=22050:start=0,atrim=0:{d},asetpts=N/SR/TB,volume=0.25[sine];"
@@ -438,12 +439,12 @@ def gen_ambient_music(out_path:str, duration_sec:float)->Optional[str]:
           "-map","[aout]","-t",str(dur), out_path]
     if _run_ffmpeg(cmdA) and os.path.exists(out_path) and os.path.getsize(out_path)>0:
         log("[MUSIC] ambient generated (pad+noise)"); return out_path
-    # B) sadece noise
+    # B) noise only
     cmdB=["ffmpeg","-y","-f","lavfi","-i",f"anoisesrc=d={dur}:color=pink:amplitude=0.015",
           "-af","lowpass=f=3500,volume=0.9","-t",str(dur), out_path]
     if _run_ffmpeg(cmdB) and os.path.exists(out_path) and os.path.getsize(out_path)>0:
         log("[MUSIC] ambient generated (noise only)"); return out_path
-    # C) sessizlik
+    # C) silence
     cmdC=["ffmpeg","-y","-f","lavfi","-i","anullsrc=r=44100:cl=mono","-t",str(dur), out_path]
     if _run_ffmpeg(cmdC) and os.path.exists(out_path) and os.path.getsize(out_path)>0:
         log("[MUSIC] ambient generated (silence)"); return out_path
@@ -529,7 +530,7 @@ def render_video(title, sentences, narration_mp3, images, duration_hint, wiki_ti
         save_text(txt, fn, width=W-220, fontsize=36, bold=False)
         subs.append(ImageClip(fn).set_start(s).set_duration(e-s).set_position(("center",H-340)).fadein(0.10).fadeout(0.10))
 
-    # --- Music (robust) ---
+    # --- Music: loop + safe trim ---
     music_path = pick_music()
     if not music_path:
         music_path = str(DATA/"ambient_autogen.mp3")
@@ -540,15 +541,19 @@ def render_video(title, sentences, narration_mp3, images, duration_hint, wiki_ti
     audio_layers=[voice.set_start(0)]
     if music_path and os.path.exists(music_path) and os.path.getsize(music_path)>0:
         try:
-            music_track=AudioFileClip(music_path).volumex(0.12).audio_fadein(0.8).audio_fadeout(1.0)
-            audio_layers.append(music_track.set_duration(duration))
-            log(f"[MUSIC] using: {music_path}")
+            m = AudioFileClip(music_path)
+            # hedefe kadar uzat, sonra güvenli kırp
+            if (m.duration or 0) < (duration - 0.05):
+                m = m.fx(afx.audio_loop, duration=duration+0.5)
+            m = m.subclip(0, max(0.0, duration-0.15)).volumex(0.12).audio_fadein(0.8).audio_fadeout(1.0)
+            audio_layers.append(m.set_start(0))
+            log(f"[MUSIC] using: {music_path} (looped/trimmed)")
         except Exception as e:
             log(f"[MUSIC] failed to load, proceeding without music: {e}")
     else:
         log("[MUSIC] no music file present; proceeding without music")
 
-    comp_audio=CompositeAudioClip([a.fx(afx.audio_normalize) for a in audio_layers])
+    comp_audio=CompositeAudioClip([a.fx(afx.audio_normalize) for a in audio_layers]).set_duration(duration-0.05)
     comp=(CompositeVideoClip([broll, title_clip, *subs]).set_audio(comp_audio).set_duration(duration))
 
     out=f"{safe_title.replace(' ','_')[:80]}.mp4"
